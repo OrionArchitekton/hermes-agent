@@ -40,6 +40,60 @@ except Exception:  # pragma: no cover - fail-open when optional dep is missing
     propagate_attributes = None
 
 
+# --- OpenTelemetry cross-context detach guard (estate-local patch, 2026-06-20) ---
+# The langfuse SDK ends spans / flushes from async-teardown paths (e.g.
+# GeneratorExit during loop/interpreter shutdown) where the OTel context token
+# was created in a *different* contextvars Context than the one detaching it.
+# opentelemetry.context.detach() then calls _RUNTIME_CONTEXT.detach(token), which
+# raises "ValueError: <Token ...> was created in a different Context". OTel logs
+# this at ERROR ("Failed to detach context") with a full traceback, and when it
+# surfaces during GeneratorExit handling it has contributed to fatal teardown
+# exits (status=1) of the gateway. This is a benign, well-known cross-framework
+# teardown race (langfuse#8780/#8316; google/adk-python#860): the span is already
+# ending, so failing to reset the contextvar is harmless. Guard
+# _RUNTIME_CONTEXT.detach so ONLY this specific ValueError is swallowed quietly;
+# any other detach error still propagates unchanged. Idempotent and fail-open.
+_OTEL_DETACH_GUARD_INSTALLED = False
+
+
+def _install_otel_detach_guard() -> None:
+    global _OTEL_DETACH_GUARD_INSTALLED
+    if _OTEL_DETACH_GUARD_INSTALLED:
+        return
+    try:
+        from opentelemetry import context as _otel_context
+
+        runtime = getattr(_otel_context, "_RUNTIME_CONTEXT", None)
+        if runtime is None:
+            return
+        current = runtime.detach
+        if getattr(current, "_hermes_guarded", False):
+            _OTEL_DETACH_GUARD_INSTALLED = True
+            return
+
+        def _guarded_detach(token: Any) -> None:
+            try:
+                return current(token)
+            except ValueError as exc:
+                if "was created in a different Context" in str(exc):
+                    logger.debug(
+                        "otel detach guard: swallowed benign cross-context detach: %s",
+                        exc,
+                    )
+                    return None
+                raise
+
+        _guarded_detach._hermes_guarded = True  # type: ignore[attr-defined]
+        runtime.detach = _guarded_detach  # type: ignore[assignment]
+        _OTEL_DETACH_GUARD_INSTALLED = True
+        logger.debug("installed OpenTelemetry cross-context detach guard")
+    except Exception as exc:  # pragma: no cover - fail-open; never break import
+        logger.debug("OpenTelemetry detach guard not installed: %s", exc)
+
+
+_install_otel_detach_guard()
+
+
 @dataclass
 class TraceState:
     trace_id: str
