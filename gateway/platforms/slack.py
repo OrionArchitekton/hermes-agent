@@ -892,6 +892,10 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_file_change(event, say):
                 pass
 
+            @self._app.event("member_joined_channel")
+            async def handle_member_joined_channel(event, say):
+                pass
+
             # Reactions are useful lightweight acknowledgements in Slack, but
             # Hermes does not currently need to route them into the agent loop.
             # Ack the events explicitly so high-traffic channels do not fill
