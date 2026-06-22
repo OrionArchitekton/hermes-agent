@@ -143,7 +143,7 @@ class AtlasEstateMemoryProvider(MemoryProvider):
                 continue
             namespace = str(hit.get("namespace") or "").strip()
             similarity = hit.get("similarity")
-            prefix = f"- [{namespace or unknown}"
+            prefix = f"- [{namespace or 'unknown'}"
             if isinstance(similarity, (float, int)):
                 prefix += f" sim={similarity:.3f}"
             prefix += "] "
