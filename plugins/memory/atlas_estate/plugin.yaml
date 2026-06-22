@@ -1,0 +1,3 @@
+name: atlas_estate
+version: 0.1.0
+description: "Read-only Orion Atlas estate recall via the MemoryProvider interface."
