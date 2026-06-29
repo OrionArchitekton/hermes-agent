@@ -6828,6 +6828,18 @@ def _default_spawn(
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
 
+    # A kanban worker is an unattended dispatcher child, never an interactive,
+    # gateway, exec-ask, or yolo session. Strip parent approval context before
+    # setting the cron marker so a gateway/operator shell cannot accidentally
+    # widen the worker's approval posture.
+    for unsafe_var in (
+        "HERMES_YOLO_MODE",
+        "HERMES_INTERACTIVE",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_EXEC_ASK",
+    ):
+        env.pop(unsafe_var, None)
+
     # Mark every dispatched kanban worker as a cron session so it inherits
     # approvals.cron_mode (deny by default). Workers spawned here run
     # non-interactively (no HERMES_INTERACTIVE / gateway / HERMES_EXEC_ASK

@@ -433,3 +433,43 @@ class TestKanbanWorkerIsCronSession:
             "kanban-dispatched worker must run as a cron session so "
             "approvals.cron_mode (deny) closes the auto-approve fallthrough"
         )
+
+    def test_default_spawn_strips_parent_approval_bypass_context(
+        self,
+        _kanban_fresh_home,
+        monkeypatch,
+    ):
+        captured = {}
+
+        class FakeProc:
+            pid = 4242
+
+        def fake_popen(cmd, *args, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["env"] = dict(kwargs.get("env", {}))
+            return FakeProc()
+
+        monkeypatch.setattr(_subprocess, "Popen", fake_popen)
+        monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+
+        _kb.create_board("cronsess")
+        _kb._default_spawn(
+            self._make_task(),
+            str(_kanban_fresh_home / "ws"),
+            board="cronsess",
+        )
+
+        env = captured["env"]
+        assert env.get("HERMES_CRON_SESSION") == "1"
+        for unsafe_var in (
+            "HERMES_YOLO_MODE",
+            "HERMES_INTERACTIVE",
+            "HERMES_GATEWAY_SESSION",
+            "HERMES_EXEC_ASK",
+        ):
+            assert unsafe_var not in env
+        assert "--oneshot" not in captured["cmd"]
+        assert "-z" not in captured["cmd"]
