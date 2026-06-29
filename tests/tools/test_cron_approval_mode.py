@@ -339,3 +339,97 @@ class TestCronWithGatewayOrigin:
                 assert result.get("status") != "approval_required"
         finally:
             clear_session_vars(tokens)
+
+
+# ---------------------------------------------------------------------------
+# Kanban-dispatched workers must run as cron sessions (fail-closed)
+# ---------------------------------------------------------------------------
+#
+# A worker spawned by the kanban dispatcher (``kanban_db._default_spawn``)
+# runs non-interactively: no HERMES_INTERACTIVE / gateway / HERMES_EXEC_ASK
+# context.  Without a HERMES_CRON_SESSION marker it hits the auto-approve
+# fallthrough in ``check_all_command_guards`` and would approve dangerous
+# commands with no human present.  Pinning ``HERMES_CRON_SESSION=1`` in the
+# spawn env makes every dispatched worker inherit ``approvals.cron_mode``
+# (deny by default), closing the fallthrough.  The cron_mode=deny behaviour
+# itself is covered by the Test* classes above; this proves the dispatcher
+# actually marks its workers as cron sessions.
+
+import subprocess as _subprocess
+import sys as _sys
+from pathlib import Path as _Path
+
+_WORKTREE = _Path(__file__).resolve().parents[2]
+if str(_WORKTREE) not in _sys.path:
+    _sys.path.insert(0, str(_WORKTREE))
+
+from hermes_cli import kanban_db as _kb
+
+
+@pytest.fixture
+def _kanban_fresh_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME with no prior kanban state (mirrors test_kanban_boards)."""
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for var in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_HOME",
+        "HERMES_KANBAN_BOARD",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    try:
+        import hermes_constants
+        hermes_constants._cached_default_hermes_root = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    _kb._INITIALIZED_PATHS.clear()
+    return home
+
+
+class TestKanbanWorkerIsCronSession:
+    """Workers spawned by the kanban dispatcher inherit the cron-deny posture."""
+
+    def _make_task(self):
+        return _kb.Task(
+            id="t_cron",
+            title="cron session test",
+            body=None,
+            assignee="teknium",
+            status="ready",
+            priority=0,
+            created_by="user",
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+
+    def test_default_spawn_marks_worker_as_cron_session(self, _kanban_fresh_home, monkeypatch):
+        captured = {}
+
+        class FakeProc:
+            pid = 4242
+
+        def fake_popen(cmd, *args, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            return FakeProc()
+
+        monkeypatch.setattr(_subprocess, "Popen", fake_popen)
+        _kb.create_board("cronsess")
+        _kb._default_spawn(
+            self._make_task(),
+            str(_kanban_fresh_home / "ws"),
+            board="cronsess",
+        )
+
+        env = captured["env"]
+        assert env.get("HERMES_CRON_SESSION") == "1", (
+            "kanban-dispatched worker must run as a cron session so "
+            "approvals.cron_mode (deny) closes the auto-approve fallthrough"
+        )

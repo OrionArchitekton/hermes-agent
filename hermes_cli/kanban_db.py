@@ -7312,6 +7312,15 @@ def _default_spawn(
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
 
+    # Mark every dispatched kanban worker as a cron session so it inherits
+    # approvals.cron_mode (deny by default). Workers spawned here run
+    # non-interactively (no HERMES_INTERACTIVE / gateway / HERMES_EXEC_ASK
+    # context), which otherwise hits the auto-approve fallthrough in
+    # check_all_command_guards(): a dangerous command would be approved with
+    # no human present. cron_mode=deny blocks dangerous commands while
+    # leaving benign ones unaffected (mirrors cron/scheduler.py).
+    env["HERMES_CRON_SESSION"] = "1"
+
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
     # config.  Without this, `env = dict(os.environ)` copies only the parent's
