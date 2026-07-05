@@ -2702,7 +2702,9 @@ class TestRunJobWakeGate:
             )
 
         assert success is False
-        assert "pre-run script output reported failure" in err
+        assert err is not None
+        assert err.startswith("pre-run script output reported failure (")
+        assert "ALERT pr-digest failed" in err
         assert "rc=124" in err
         assert final == "reported failure"
         assert failure_output in doc
