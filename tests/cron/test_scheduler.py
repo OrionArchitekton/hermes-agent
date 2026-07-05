@@ -2681,6 +2681,59 @@ class TestRunJobWakeGate:
 
         agent_cls.assert_called_once()  # Agent DID wake despite the gate-like text
 
+    def test_failure_shaped_script_output_marks_cron_failed_after_reporting(self):
+        """A wrapper that exits 0 while reporting an inner failure must not
+        let a successful agent report overwrite the failed cron status."""
+        import cron.scheduler as scheduler
+
+        failure_output = (
+            "ALERT pr-digest failed at 2026-07-04 14:01Z (rc=124). "
+            "First error line: [run.py] timeout after 100s"
+        )
+        agent = MagicMock()
+        agent.run_conversation = MagicMock(return_value={
+            "final_response": "reported failure", "messages": []
+        })
+        with patch.object(scheduler, "_run_job_script",
+                          return_value=(True, failure_output)), \
+             patch("run_agent.AIAgent", return_value=agent):
+            success, doc, final, err = scheduler.run_job(
+                self._make_job(name="pr-digest", script="pr_digest/run.py")
+            )
+
+        assert success is False
+        assert "pre-run script output reported failure" in err
+        assert "rc=124" in err
+        assert final == "reported failure"
+        assert failure_output in doc
+        assert "reported failure" in doc
+
+    def test_embedded_external_failure_details_do_not_flip_status(self):
+        """A normal report can mention external failures without meaning the
+        pre-run script itself failed."""
+        import cron.scheduler as scheduler
+
+        report_output = (
+            "Daily build report\n\n"
+            "- repo-a passed\n"
+            "- repo-b CI exited 1 on its feature branch\n"
+        )
+        agent = MagicMock()
+        agent.run_conversation = MagicMock(return_value={
+            "final_response": "normal report", "messages": []
+        })
+        with patch.object(scheduler, "_run_job_script",
+                          return_value=(True, report_output)), \
+             patch("run_agent.AIAgent", return_value=agent):
+            success, doc, final, err = scheduler.run_job(
+                self._make_job(name="daily-build-report", script="builds/run.py")
+            )
+
+        assert success is True
+        assert err is None
+        assert final == "normal report"
+        assert report_output in doc
+
     def test_no_script_path_runs_agent_normally(self):
         """Regression: jobs without a script still work."""
         import cron.scheduler as scheduler

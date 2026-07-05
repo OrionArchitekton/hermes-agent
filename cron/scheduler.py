@@ -1693,6 +1693,62 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+_SCRIPT_OUTPUT_FAILURE_RE = re.compile(
+    r"(?im)("
+    r"\brc\s*=\s*[1-9]\d*\b|"
+    r"\bexited\s+(?:with\s+)?(?:code\s+)?[1-9]\d*\b|"
+    r"\bscript\s+timed\s+out\b|"
+    r"\btimed\s+out\s+after\s+\d+(?:\.\d+)?s\b|"
+    r"\btimeout\s+after\s+\d+(?:\.\d+)?s\b|"
+    r"^traceback\s+\(most\s+recent\s+call\s+last\):"
+    r")"
+)
+
+
+def _compact_script_failure_excerpt(script_output: str, limit: int = 500) -> str:
+    excerpt = re.sub(r"\s+", " ", str(script_output or "").strip())
+    if len(excerpt) > limit:
+        return f"{excerpt[:limit].rstrip()}..."
+    return excerpt
+
+
+def _leading_script_output(script_output: str, line_limit: int = 1) -> str:
+    lines = []
+    for line in str(script_output or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lines.append(stripped)
+        if len(lines) >= line_limit:
+            break
+    return "\n".join(lines)
+
+
+def _classify_prerun_script_failure(success: bool, script_output: str) -> Optional[str]:
+    """Return a durable cron-status error when script output is failure-shaped.
+
+    Some data-collection wrappers intentionally exit 0 after formatting a
+    failure alert so the agent can deliver it. Delivery is useful, but the cron
+    run still needs a failed status; otherwise dashboards and retries see a
+    false green run. Keep the detector limited to machine-shaped failure
+    markers so normal reports that merely discuss failed checks do not flip the
+    cron status.
+    """
+    excerpt = _compact_script_failure_excerpt(script_output)
+    if not success:
+        return f"pre-run script failed: {excerpt}" if excerpt else "pre-run script failed"
+
+    if not excerpt:
+        return None
+
+    match = _SCRIPT_OUTPUT_FAILURE_RE.search(_leading_script_output(script_output))
+    if not match:
+        return None
+
+    marker = _compact_script_failure_excerpt(match.group(0), limit=80)
+    return f"pre-run script output reported failure ({marker}): {excerpt}"
+
+
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -2101,11 +2157,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # the whole agent run. We pass the result into _build_job_prompt so
     # the script is only executed once.
     prerun_script = None
+    prerun_script_error = None
     script_path = job.get("script")
     if script_path:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
-        if _ran_ok and not _parse_wake_gate(_script_output):
+        prerun_script_error = _classify_prerun_script_failure(_ran_ok, _script_output)
+        if _ran_ok and not prerun_script_error and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
                 job_name, job_id,
@@ -2672,7 +2730,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 {logged_response}
 """
-        
+
+        if prerun_script_error:
+            logger.warning(
+                "Job '%s' completed agent reporting after pre-run script failure: %s",
+                job_name,
+                prerun_script_error,
+            )
+            return False, output, final_response, prerun_script_error
+
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
         
