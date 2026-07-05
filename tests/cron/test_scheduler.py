@@ -2680,6 +2680,10 @@ class TestRunJobWakeGate:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
         agent_cls.assert_called_once()  # Agent DID wake despite the gate-like text
+        assert success is False
+        assert err == 'pre-run script failed: {"wakeAgent": false}'
+        assert final == "ok"
+        assert '{"wakeAgent": false}' in doc
 
     def test_failure_shaped_script_output_marks_cron_failed_after_reporting(self):
         """A wrapper that exits 0 while reporting an inner failure must not
