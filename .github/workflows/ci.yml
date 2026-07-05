@@ -2,8 +2,11 @@ name: CI
 
 # Orchestrator workflow. Runs ``detect-changes`` once, then conditionally
 # calls the sub-workflows that a PR can actually affect. A final
-# ``all-checks-pass`` gate job aggregates results so branch protection only
-# needs to require a single check.
+# ``all-checks-pass`` gate job aggregates results so branch protection can
+# require a single check. The TypeScript workflow is still called for every PR
+# because live branch protection may require its child contexts directly; the
+# reusable workflow emits successful no-op contexts when frontend files are
+# unaffected.
 #
 # Sub-workflows are triggered via ``workflow_call`` and keep their own job
 # definitions, matrices, and concurrency settings. They no longer have
@@ -73,8 +76,9 @@ jobs:
   typecheck:
     name: TypeScript
     needs: detect
-    if: needs.detect.outputs.frontend == 'true'
     uses: ./.github/workflows/typecheck.yml
+    with:
+      run_checks: ${{ needs.detect.outputs.frontend == 'true' }}
 
   docs-site:
     name: Docs Site
