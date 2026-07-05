@@ -100,6 +100,45 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
     assert mark == ("mark", "j5", False)
 
 
+def test_run_one_job_failed_job_delivers_available_final_response(monkeypatch):
+    """A failed job with a detailed final response delivers that report."""
+    delivered = []
+
+    def fake_run_job(job):
+        return (
+            False,
+            "saved output",
+            "detailed pre-run script failure report",
+            "pre-run script output reported failure (rc=124): ALERT pr-digest failed",
+        )
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda job, content, adapters=None, loop=None: delivered.append(content),
+    )
+    marks = []
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok, err)),
+    )
+
+    ok = s.run_one_job({"id": "j7", "name": "pr-digest"})
+
+    assert ok is True
+    assert delivered == ["detailed pre-run script failure report"]
+    assert marks == [
+        (
+            "j7",
+            False,
+            "pre-run script output reported failure (rc=124): ALERT pr-digest failed",
+        )
+    ]
+
+
 def test_run_one_job_exception_marks_failure(monkeypatch):
     """If run_job raises, the helper marks the run failed and returns False
     rather than propagating."""

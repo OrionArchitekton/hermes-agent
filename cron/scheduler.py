@@ -2843,7 +2843,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # Deliver the final response to the origin/target chat.
         # If the agent responded with [SILENT], skip delivery (but
         # output is already saved above).  Failed jobs always deliver.
-        deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+        if success or final_response.strip():
+            deliver_content = final_response
+        else:
+            deliver_content = _summarize_cron_failure_for_delivery(job, error)
         # Treat whitespace-only final responses the same as empty
         # responses: do not deliver a blank message, and let the
         # empty-response guard below mark the run as a soft failure.
