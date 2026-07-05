@@ -3646,7 +3646,7 @@ def run_job(
                 job_name,
                 prerun_script_error,
             )
-            return False, output, final_response, prerun_script_error
+            return False, output, str(final_response), prerun_script_error
 
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
