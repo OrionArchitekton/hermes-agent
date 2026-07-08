@@ -4928,6 +4928,75 @@ def _platform_status(platform: dict) -> str:
     return "not configured"
 
 
+def _compact_status_text(value, *, width: int = 140) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    return textwrap.shorten(text, width=width, placeholder="...")
+
+
+def _delivery_parts(deliver) -> list[str]:
+    if deliver is None or deliver == "":
+        return ["local"]
+    if isinstance(deliver, (list, tuple, set)):
+        parts: list[str] = []
+        for item in deliver:
+            parts.extend(_delivery_parts(item))
+        return parts or ["local"]
+    return [part.strip() for part in str(deliver).split(",") if part.strip()] or [
+        "local"
+    ]
+
+
+def _job_targets_platform(job: dict, platform_name: str) -> bool:
+    platform_key = platform_name.lower()
+    for part in _delivery_parts(job.get("deliver", "local")):
+        target = part.lower()
+        if target == platform_key or target.startswith(f"{platform_key}:"):
+            return True
+        if target == "origin":
+            origin = job.get("origin") or {}
+            if str(origin.get("platform") or "").lower() == platform_key:
+                return True
+        if target == "all" and platform_key in _compact_status_text(
+            job.get("last_delivery_error")
+        ).lower():
+            return True
+    return False
+
+
+def _slack_cron_delivery_issue_lines() -> list[str]:
+    try:
+        from cron.jobs import load_jobs
+
+        jobs = load_jobs()
+    except Exception:
+        return []
+
+    failures: list[dict] = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        error = job.get("last_delivery_error")
+        if not error or not _job_targets_platform(job, "slack"):
+            continue
+        failures.append(job)
+
+    if not failures:
+        return []
+
+    failures.sort(key=lambda job: str(job.get("last_run_at") or ""))
+    latest = failures[-1]
+    latest_label = _compact_status_text(
+        latest.get("name") or latest.get("id") or "job", width=40
+    )
+    latest_error = _compact_status_text(latest.get("last_delivery_error"))
+    return [
+        "⚠ Slack cron delivery: "
+        f"{len(failures)} job(s) failing; latest {latest_label}: {latest_error}"
+    ]
+
+
 def _runtime_health_lines() -> list[str]:
     """Summarize the latest persisted gateway runtime health state."""
     try:
@@ -4947,9 +5016,14 @@ def _runtime_health_lines() -> list[str]:
     platforms = state.get("platforms", {}) or {}
 
     for platform, pdata in platforms.items():
-        if pdata.get("state") == "fatal":
+        platform_state = str(pdata.get("state") or "").lower()
+        if platform_state == "fatal":
             message = pdata.get("error_message") or "unknown error"
             lines.append(f"⚠ {platform}: {message}")
+        elif platform_state == "disconnected":
+            message = _compact_status_text(pdata.get("error_message"))
+            detail = f" ({message})" if message else ""
+            lines.append(f"⚠ {platform}: disconnected{detail}")
 
     if gateway_state == "startup_failed" and exit_reason:
         lines.append(f"⚠ Last startup issue: {exit_reason}")
@@ -4959,6 +5033,8 @@ def _runtime_health_lines() -> list[str]:
         lines.append(f"⏳ Gateway draining for {action} ({count} active agent(s))")
     elif gateway_state == "stopped" and exit_reason:
         lines.append(f"⚠ Last shutdown reason: {exit_reason}")
+
+    lines.extend(_slack_cron_delivery_issue_lines())
 
     return lines
 
