@@ -22,6 +22,81 @@ def test_runtime_health_lines_include_fatal_platform_and_startup_reason(monkeypa
     assert "⚠ Last startup issue: telegram conflict" in lines
 
 
+def test_runtime_health_lines_include_nonfatal_slack_disconnect(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {
+            "gateway_state": "running",
+            "platforms": {
+                "slack": {
+                    "state": "disconnected",
+                    "error_message": "socket mode reconnect failed",
+                }
+            },
+        },
+    )
+
+    lines = _runtime_health_lines()
+
+    assert "⚠ slack: disconnected (socket mode reconnect failed)" in lines
+
+
+def test_runtime_health_lines_include_slack_cron_delivery_failures(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {"gateway_state": "running", "platforms": {}},
+    )
+    monkeypatch.setattr(
+        "cron.jobs.load_jobs",
+        lambda: [
+            {
+                "id": "slack-digest",
+                "name": "ops digest",
+                "deliver": "slack:C123",
+                "last_run_at": "2026-07-07T20:00:00Z",
+                "last_delivery_error": "delivery to slack:C123 failed: timeout",
+            },
+            {
+                "id": "telegram-digest",
+                "name": "telegram digest",
+                "deliver": "telegram",
+                "last_run_at": "2026-07-07T20:01:00Z",
+                "last_delivery_error": "delivery to telegram failed",
+            },
+            {
+                "id": "slack-origin",
+                "name": "approval loop",
+                "deliver": "origin",
+                "origin": {"platform": "slack", "chat_id": "C999"},
+                "last_run_at": "2026-07-07T20:02:00Z",
+                "last_delivery_error": "delivery to slack:C999 failed: missing channel",
+            },
+        ],
+    )
+
+    lines = _runtime_health_lines()
+
+    assert (
+        "⚠ Slack cron delivery: 2 job(s) failing; latest approval loop: "
+        "delivery to slack:C999 failed: missing channel"
+    ) in lines
+    assert not any("telegram digest" in line for line in lines)
+
+
+def test_runtime_health_lines_ignores_cron_storage_failures(monkeypatch):
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {"gateway_state": "running", "platforms": {}},
+    )
+
+    def _raise_load_error():
+        raise RuntimeError("jobs database unreadable")
+
+    monkeypatch.setattr("cron.jobs.load_jobs", _raise_load_error)
+
+    assert _runtime_health_lines() == []
+
+
 def test_runtime_status_running_pid_validates_live_gateway_record(monkeypatch):
     from gateway import status as status_mod
 
