@@ -444,6 +444,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons.
         self._approval_resolved: Dict[str, bool] = {}
+        # Track forwarded OAC approval decisions by approval_id to prevent
+        # duplicate or conflicting decisions from Slack double-clicks.
+        self._approval_decision_resolved: Dict[str, str] = {}
+        self._APPROVAL_DECISION_RESOLVED_MAX = 5000
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
         self._bot_message_ts: set = set()
@@ -3358,6 +3362,44 @@ class SlackAdapter(BasePlatformAdapter):
             payload["reason"] = reason.strip()
         return payload
 
+    def _claim_approval_decision(self, payload: Dict[str, Any]) -> bool:
+        approval_id = str(payload["approval_id"])
+        decision = str(payload["decision"])
+        existing_decision = self._approval_decision_resolved.get(approval_id)
+        if existing_decision is not None:
+            if existing_decision != decision:
+                logger.warning(
+                    "[Slack] Ignoring conflicting approval decision %s for %s; "
+                    "already forwarded %s",
+                    decision,
+                    approval_id,
+                    existing_decision,
+                )
+            else:
+                logger.info(
+                    "[Slack] Ignoring duplicate approval decision %s for %s",
+                    decision,
+                    approval_id,
+                )
+            return False
+
+        if (
+            len(self._approval_decision_resolved)
+            >= self._APPROVAL_DECISION_RESOLVED_MAX
+        ):
+            oldest_approval_id = next(iter(self._approval_decision_resolved), None)
+            if oldest_approval_id is not None:
+                self._approval_decision_resolved.pop(oldest_approval_id, None)
+
+        self._approval_decision_resolved[approval_id] = decision
+        return True
+
+    def _release_failed_approval_decision(self, payload: Dict[str, Any]) -> None:
+        approval_id = str(payload["approval_id"])
+        decision = str(payload["decision"])
+        if self._approval_decision_resolved.get(approval_id) == decision:
+            self._approval_decision_resolved.pop(approval_id, None)
+
     async def _post_approval_decision(
         self,
         payload: Dict[str, Any],
@@ -3424,7 +3466,13 @@ class SlackAdapter(BasePlatformAdapter):
 
         try:
             payload = self._build_approval_decision_payload(body, action, config)
-            await self._post_approval_decision(payload, config)
+            if not self._claim_approval_decision(payload):
+                return
+            try:
+                await self._post_approval_decision(payload, config)
+            except Exception:
+                self._release_failed_approval_decision(payload)
+                raise
             logger.info(
                 "[Slack] Forwarded approval decision %s for %s by %s",
                 payload["decision"],

@@ -401,6 +401,80 @@ class TestSlackApprovalDecisionAction:
         assert config["url"] == "http://approvals-store:8091/decision"
         assert config["token"] == "receiver-token"
 
+    @pytest.mark.asyncio
+    async def test_deduplicates_conflicting_approval_decision_clicks(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        monkeypatch.setenv(
+            "SLACK_APPROVAL_DECISION_URL", "http://approvals-store:8091/decision"
+        )
+        monkeypatch.setenv("SLACK_APPROVAL_DECISION_TOKEN", "receiver-token")
+
+        body = {
+            "message": {"ts": "1720390000.000100"},
+            "channel": {"id": "COPS"},
+            "user": {"name": "dan", "id": "U_DAN"},
+        }
+        approve_action = {
+            "action_id": "approval_decision:approve",
+            "value": json.dumps(
+                {
+                    "approval_id": "appr-linkedin-001",
+                    "flow": "linkedin-comment",
+                    "target": "linkedin:comment:post-123",
+                }
+            ),
+        }
+        reject_action = {
+            "action_id": "approval_decision:reject",
+            "value": approve_action["value"],
+        }
+        adapter._post_approval_decision = AsyncMock(return_value={"ok": True})
+
+        await adapter._handle_approval_decision_action(
+            AsyncMock(), body, approve_action
+        )
+        await adapter._handle_approval_decision_action(AsyncMock(), body, reject_action)
+
+        adapter._post_approval_decision.assert_awaited_once()
+        payload, _config = adapter._post_approval_decision.call_args.args
+        assert payload["decision"] == "approve"
+
+    @pytest.mark.asyncio
+    async def test_failed_approval_decision_post_can_be_retried(self, monkeypatch):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        monkeypatch.setenv(
+            "SLACK_APPROVAL_DECISION_URL", "http://approvals-store:8091/decision"
+        )
+        monkeypatch.setenv("SLACK_APPROVAL_DECISION_TOKEN", "receiver-token")
+
+        body = {
+            "message": {"ts": "1720390000.000100"},
+            "channel": {"id": "COPS"},
+            "user": {"name": "dan", "id": "U_DAN"},
+        }
+        action = {
+            "action_id": "approval_decision:approve",
+            "value": json.dumps(
+                {
+                    "approval_id": "appr-linkedin-001",
+                    "flow": "linkedin-comment",
+                    "target": "linkedin:comment:post-123",
+                }
+            ),
+        }
+        adapter._post_approval_decision = AsyncMock(
+            side_effect=[RuntimeError("receiver down"), {"ok": True}]
+        )
+
+        await adapter._handle_approval_decision_action(AsyncMock(), body, action)
+        await adapter._handle_approval_decision_action(AsyncMock(), body, action)
+
+        assert adapter._post_approval_decision.await_count == 2
+
     def test_approval_decision_payload_allows_multiline_reason(self):
         adapter = _make_adapter()
         body = {
