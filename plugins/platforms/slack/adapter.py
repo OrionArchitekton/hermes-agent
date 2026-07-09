@@ -17,6 +17,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
+from urllib.parse import urlparse
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -56,6 +57,10 @@ from gateway.platforms.base import (
 
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_APPROVAL_DECISION_ACTION_PREFIX = "approval_decision:"
+DEFAULT_APPROVAL_DECISION_TIMEOUT_MS = 5000
+APPROVAL_DECISION_CHOICES = {"approve", "reject"}
 
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
@@ -439,6 +444,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons.
         self._approval_resolved: Dict[str, bool] = {}
+        # Track forwarded OAC approval decisions by approval_id to prevent
+        # duplicate or conflicting decisions from Slack double-clicks.
+        self._approval_decision_resolved: Dict[str, str] = {}
+        self._APPROVAL_DECISION_RESOLVED_MAX = 5000
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
         self._bot_message_ts: set = set()
@@ -1109,6 +1118,17 @@ class SlackAdapter(BasePlatformAdapter):
                 "hermes_confirm_cancel",
             ):
                 self._app.action(_action_id)(self._handle_slash_confirm_action)
+
+            approval_action_prefix = os.getenv(
+                "SLACK_APPROVAL_ACTION_PREFIX",
+                DEFAULT_APPROVAL_DECISION_ACTION_PREFIX,
+            )
+            approval_decision_pattern = _re.compile(
+                r"^" + _re.escape(approval_action_prefix) + r"(?:approve|reject)$"
+            )
+            self._app.action(approval_decision_pattern)(
+                self._handle_approval_decision_action
+            )
 
             # Register plugin-provided Block Kit action handlers.
             #
@@ -3250,6 +3270,221 @@ class SlackAdapter(BasePlatformAdapter):
             return "*" in allowed_ids or normalized_user_id in allowed_ids
 
         return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+
+    def _approval_decision_config_from_env(self) -> Dict[str, Any]:
+        timeout_raw = os.getenv("SLACK_APPROVAL_DECISION_TIMEOUT_MS", "").strip()
+        timeout_ms = DEFAULT_APPROVAL_DECISION_TIMEOUT_MS
+        if timeout_raw:
+            try:
+                parsed_timeout = int(timeout_raw)
+                if parsed_timeout <= 0:
+                    raise ValueError("timeout must be positive")
+                timeout_ms = parsed_timeout
+            except ValueError:
+                logger.warning(
+                    "[Slack] Ignoring invalid SLACK_APPROVAL_DECISION_TIMEOUT_MS=%r",
+                    timeout_raw,
+                )
+
+        return {
+            "url": os.getenv("SLACK_APPROVAL_DECISION_URL", "").strip(),
+            "token": os.getenv("SLACK_APPROVAL_DECISION_TOKEN", "").strip(),
+            "action_prefix": os.getenv(
+                "SLACK_APPROVAL_ACTION_PREFIX",
+                DEFAULT_APPROVAL_DECISION_ACTION_PREFIX,
+            ),
+            "timeout_ms": timeout_ms,
+        }
+
+    @staticmethod
+    def _required_approval_decision_text(name: str, value: Any) -> str:
+        text = value if isinstance(value, str) else ""
+        text = text.strip()
+        if not text:
+            raise ValueError(f"{name} is required")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+            raise ValueError(f"{name} must not contain control characters")
+        return text
+
+    def _build_approval_decision_payload(
+        self,
+        body: Dict[str, Any],
+        action: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        action_id = self._required_approval_decision_text(
+            "action_id", action.get("action_id")
+        )
+        action_prefix = str(
+            config.get("action_prefix") or DEFAULT_APPROVAL_DECISION_ACTION_PREFIX
+        )
+        if not action_id.startswith(action_prefix):
+            raise ValueError("action_id is not an approval decision action")
+
+        decision = action_id[len(action_prefix) :]
+        if decision not in APPROVAL_DECISION_CHOICES:
+            raise ValueError("decision must be approve or reject")
+
+        try:
+            value = json.loads(action.get("value") or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"action value is not valid JSON: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ValueError("action value must be a JSON object")
+
+        payload: Dict[str, Any] = {
+            "approval_id": self._required_approval_decision_text(
+                "approval_id", value.get("approval_id")
+            ),
+            "decision": decision,
+            "flow": self._required_approval_decision_text("flow", value.get("flow")),
+            "target": self._required_approval_decision_text(
+                "target", value.get("target")
+            ),
+            "slack_channel_id": self._required_approval_decision_text(
+                "slack_channel_id",
+                body.get("channel", {}).get("id")
+                or body.get("container", {}).get("channel_id")
+                or "",
+            ),
+            "slack_message_ts": self._required_approval_decision_text(
+                "slack_message_ts",
+                body.get("message", {}).get("ts")
+                or body.get("container", {}).get("message_ts")
+                or "",
+            ),
+            "operator_id": self._required_approval_decision_text(
+                "operator_id", body.get("user", {}).get("id")
+            ),
+        }
+        reason = value.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            payload["reason"] = reason.strip()
+        return payload
+
+    def _claim_approval_decision(self, payload: Dict[str, Any]) -> bool:
+        approval_id = str(payload["approval_id"])
+        decision = str(payload["decision"])
+        existing_decision = self._approval_decision_resolved.get(approval_id)
+        if existing_decision is not None:
+            if existing_decision != decision:
+                logger.warning(
+                    "[Slack] Ignoring conflicting approval decision %s for %s; "
+                    "already forwarded %s",
+                    decision,
+                    approval_id,
+                    existing_decision,
+                )
+            else:
+                logger.info(
+                    "[Slack] Ignoring duplicate approval decision %s for %s",
+                    decision,
+                    approval_id,
+                )
+            return False
+
+        if (
+            len(self._approval_decision_resolved)
+            >= self._APPROVAL_DECISION_RESOLVED_MAX
+        ):
+            oldest_approval_id = next(iter(self._approval_decision_resolved), None)
+            if oldest_approval_id is not None:
+                self._approval_decision_resolved.pop(oldest_approval_id, None)
+
+        self._approval_decision_resolved[approval_id] = decision
+        return True
+
+    def _release_failed_approval_decision(self, payload: Dict[str, Any]) -> None:
+        approval_id = str(payload["approval_id"])
+        decision = str(payload["decision"])
+        if self._approval_decision_resolved.get(approval_id) == decision:
+            self._approval_decision_resolved.pop(approval_id, None)
+
+    async def _post_approval_decision(
+        self,
+        payload: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        url = str(config.get("url") or "").strip()
+        token = str(config.get("token") or "").strip()
+        if not url:
+            raise ValueError("approval receiver URL is not configured")
+        if not token:
+            raise ValueError("approval receiver token is not configured")
+
+        parsed_url = urlparse(url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            raise ValueError("approval receiver URL must be http or https")
+
+        timeout_ms = int(
+            config.get("timeout_ms") or DEFAULT_APPROVAL_DECISION_TIMEOUT_MS
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "X-Brand-Dashboard": "1",
+            "X-Trigger-Token": token,
+        }
+        async with aiohttp.ClientSession(trust_env=True) as session:
+            async with session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000),
+            ) as resp:
+                text = await resp.text()
+                if resp.status < 200 or resp.status >= 300:
+                    raise RuntimeError(f"approval receiver {resp.status}: {text[:200]}")
+                return json.loads(text) if text else {}
+
+    async def _handle_approval_decision_action(self, ack, body, action) -> None:
+        """Forward a Slack approval-card button click to the approvals store."""
+        await ack()
+
+        channel_id = body.get("channel", {}).get("id") or body.get("container", {}).get(
+            "channel_id", ""
+        )
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+        if not self._is_interactive_user_authorized(
+            user_id,
+            channel_id=channel_id,
+            user_name=user_name,
+        ):
+            logger.warning(
+                "[Slack] Unauthorized approval-decision click by %s (%s) - ignoring",
+                user_name,
+                user_id,
+            )
+            return
+
+        config = self._approval_decision_config_from_env()
+        if not config.get("url") or not config.get("token"):
+            logger.error(
+                "[Slack] Approval decision receiver is not configured; action ignored"
+            )
+            return
+
+        try:
+            payload = self._build_approval_decision_payload(body, action, config)
+            if not self._claim_approval_decision(payload):
+                return
+            try:
+                await self._post_approval_decision(payload, config)
+            except Exception:
+                self._release_failed_approval_decision(payload)
+                raise
+            logger.info(
+                "[Slack] Forwarded approval decision %s for %s by %s",
+                payload["decision"],
+                payload["approval_id"],
+                user_name,
+            )
+        except Exception as exc:
+            logger.error(
+                "[Slack] Approval decision was not recorded: %s",
+                exc,
+                exc_info=True,
+            )
 
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:
         """Handle a slash-confirm button click from Block Kit."""

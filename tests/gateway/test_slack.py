@@ -799,6 +799,10 @@ class TestSlackProxyBehavior:
         assert adapter._handler is not None
         assert adapter._handler.proxy == "http://proxy.example.com:3128"
         assert adapter._handler.client.proxy == "http://proxy.example.com:3128"
+        assert any(
+            getattr(action, "pattern", "") == r"^approval_decision:(?:approve|reject)$"
+            for action in created_apps[0].registered_actions
+        )
 
     @pytest.mark.asyncio
     async def test_connect_clears_proxy_when_no_proxy_matches_slack(self):
