@@ -790,9 +790,8 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     respawn_cwd_literal = json.dumps(respawn_cwd)
     respawn_env_literal = json.dumps(respawn_env_overlay)
 
-    watcher = (
-        textwrap.dedent(
-            """
+    watcher = textwrap.dedent(
+        """
         import os
         import subprocess
         import sys
@@ -850,12 +849,9 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
             _popen_kwargs["start_new_session"] = True
             subprocess.Popen(cmd, **_popen_kwargs)
         """
-        )
-        .strip()
-        .format(
-            respawn_cwd_literal=respawn_cwd_literal,
-            respawn_env_literal=respawn_env_literal,
-        )
+    ).strip().format(
+        respawn_cwd_literal=respawn_cwd_literal,
+        respawn_env_literal=respawn_env_literal,
     )
 
     watcher_argv = [
