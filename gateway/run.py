@@ -18747,8 +18747,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     #   - hermes update killing the gateway mid-work
     #   - External kill commands
     #   - WSL2/container runtime sending unexpected signals
-    # `hermes gateway stop` and interactive Ctrl+C are handled above as
-    # planned stops and should not trigger service-manager revival.
+    # `hermes gateway stop`, interactive Ctrl+C, and systemd ExecStop markers
+    # are handled above as clean stops and should not trigger service-manager
+    # revival.
     if _signal_initiated_shutdown and not runner._restart_requested:
         logger.info(
             "Exiting with code 1 (signal-initiated shutdown without restart "
