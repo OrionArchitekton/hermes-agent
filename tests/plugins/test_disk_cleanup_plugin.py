@@ -14,7 +14,9 @@ Covers the bundled plugin at ``plugins/disk-cleanup/``:
 
 import importlib
 import json
+import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -382,6 +384,187 @@ class TestTrackForgetQuick:
         dg.quick()
 
         assert not (_isolate_env / "scratch").exists()
+
+    def test_quick_deletes_stale_untracked_tmp_manifest_dir(
+        self, _isolate_env, tmp_path, monkeypatch
+    ):
+        dg = _load_lib()
+        tmp_root = tmp_path / "tmp"
+        tmp_root.mkdir()
+        monkeypatch.setattr(dg, "_TMP_ROOT", tmp_root, raising=False)
+
+        manifest_dir = tmp_root / "hermes-slack-command-center-manifest-20260709"
+        manifest_dir.mkdir()
+        payload = manifest_dir / "payload.bin"
+        payload.write_bytes(b"x" * 128)
+
+        old = (datetime.now(timezone.utc) - timedelta(hours=13)).timestamp()
+        os.utime(payload, (old, old))
+        os.utime(manifest_dir, (old, old))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 1
+        assert summary["freed"] >= 128
+        assert not manifest_dir.exists()
+
+    def test_quick_preserves_fresh_untracked_tmp_manifest_dir(
+        self, _isolate_env, tmp_path, monkeypatch
+    ):
+        dg = _load_lib()
+        tmp_root = tmp_path / "tmp"
+        tmp_root.mkdir()
+        monkeypatch.setattr(dg, "_TMP_ROOT", tmp_root, raising=False)
+
+        manifest_dir = tmp_root / "hermes-slack-command-center-manifest-fresh"
+        manifest_dir.mkdir()
+        (manifest_dir / "payload.bin").write_bytes(b"x" * 128)
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert manifest_dir.exists()
+
+    def test_quick_deletes_stale_untracked_tmp_file(
+        self, _isolate_env, tmp_path, monkeypatch
+    ):
+        dg = _load_lib()
+        tmp_root = tmp_path / "tmp"
+        tmp_root.mkdir()
+        monkeypatch.setattr(dg, "_TMP_ROOT", tmp_root, raising=False)
+
+        probe = tmp_root / "hermes-probe.txt"
+        probe.write_bytes(b"x" * 64)
+
+        old = (datetime.now(timezone.utc) - timedelta(hours=25)).timestamp()
+        os.utime(probe, (old, old))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 1
+        assert summary["freed"] >= 64
+        assert not probe.exists()
+
+    def test_quick_preserves_fresh_untracked_tmp_file(
+        self, _isolate_env, tmp_path, monkeypatch
+    ):
+        dg = _load_lib()
+        tmp_root = tmp_path / "tmp"
+        tmp_root.mkdir()
+        monkeypatch.setattr(dg, "_TMP_ROOT", tmp_root, raising=False)
+
+        probe = tmp_root / "hermes-probe.txt"
+        probe.write_bytes(b"x" * 64)
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert probe.exists()
+
+    def test_quick_preserves_stale_tui_active_session_marker(
+        self, _isolate_env, tmp_path, monkeypatch
+    ):
+        dg = _load_lib()
+        tmp_root = tmp_path / "tmp"
+        tmp_root.mkdir()
+        monkeypatch.setattr(dg, "_TMP_ROOT", tmp_root, raising=False)
+
+        marker = tmp_root / "hermes-pty-active-session.json"
+        marker.write_text('{"session_id": "live"}')
+
+        old = (datetime.now(timezone.utc) - timedelta(hours=25)).timestamp()
+        os.utime(marker, (old, old))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert marker.exists()
+
+    def test_quick_preserves_tracked_tmp_manifest_dir(
+        self, _isolate_env, tmp_path, monkeypatch
+    ):
+        dg = _load_lib()
+        tmp_root = tmp_path / "tmp"
+        tmp_root.mkdir()
+        monkeypatch.setattr(dg, "_TMP_ROOT", tmp_root, raising=False)
+
+        manifest_dir = tmp_root / "hermes-slack-command-center-manifest-tracked"
+        manifest_dir.mkdir()
+        payload = manifest_dir / "payload.bin"
+        payload.write_bytes(b"x" * 128)
+
+        old = (datetime.now(timezone.utc) - timedelta(hours=13)).timestamp()
+        os.utime(payload, (old, old))
+        os.utime(manifest_dir, (old, old))
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(manifest_dir.resolve()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "category": "other",
+            "size": 0,
+        }]))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert manifest_dir.exists()
+
+    def test_quick_preserves_manifest_dir_with_tracked_child(
+        self, _isolate_env, tmp_path, monkeypatch
+    ):
+        dg = _load_lib()
+        tmp_root = tmp_path / "tmp"
+        tmp_root.mkdir()
+        monkeypatch.setattr(dg, "_TMP_ROOT", tmp_root, raising=False)
+
+        manifest_dir = tmp_root / "hermes-slack-command-center-manifest-child"
+        manifest_dir.mkdir()
+        payload = manifest_dir / "payload.bin"
+        payload.write_bytes(b"x" * 128)
+
+        old = (datetime.now(timezone.utc) - timedelta(hours=13)).timestamp()
+        os.utime(payload, (old, old))
+        os.utime(manifest_dir, (old, old))
+
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True, exist_ok=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(payload.resolve()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "category": "other",
+            "size": 128,
+        }]))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert manifest_dir.exists()
+        assert payload.exists()
+
+    def test_quick_preserves_untracked_tmp_manifest_without_uid_guard(
+        self, _isolate_env, tmp_path, monkeypatch
+    ):
+        dg = _load_lib()
+        tmp_root = tmp_path / "tmp"
+        tmp_root.mkdir()
+        monkeypatch.setattr(dg, "_TMP_ROOT", tmp_root, raising=False)
+        monkeypatch.delattr(dg.os, "getuid", raising=False)
+
+        manifest_dir = tmp_root / "hermes-slack-command-center-manifest-no-uid"
+        manifest_dir.mkdir()
+        payload = manifest_dir / "payload.bin"
+        payload.write_bytes(b"x" * 128)
+
+        old = (datetime.now(timezone.utc) - timedelta(hours=13)).timestamp()
+        os.utime(payload, (old, old))
+        os.utime(manifest_dir, (old, old))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert manifest_dir.exists()
 
 
 class TestStatus:

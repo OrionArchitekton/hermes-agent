@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,6 +162,15 @@ _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
 # guard against stale tracked.json entries from before #34840.
 _PROTECTED_CRON_PATHS: set[str] = set()
 
+_TMP_ROOT = Path("/tmp")
+_UNTRACKED_TMP_MANIFEST_AGE_SECONDS = 12 * 60 * 60
+_UNTRACKED_TMP_FILE_AGE_SECONDS = 24 * 60 * 60
+_UNTRACKED_TMP_MANIFEST_NAMES = ("manifest",)
+_PROTECTED_TMP_FILE_PREFIXES = (
+    "hermes-pty-active-",
+    "hermes-tui-active-session-",
+)
+
 
 def _is_protected_cron_path(p: Path) -> bool:
     """Return True if *p* is a cron control-plane file/directory that must
@@ -189,6 +199,113 @@ def fmt_size(n: float) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
+
+
+def _tree_size(path: Path) -> int:
+    """Best-effort byte size for a file or directory without following links."""
+    try:
+        if path.is_file() and not path.is_symlink():
+            return path.stat().st_size
+        if not path.is_dir() or path.is_symlink():
+            return 0
+    except OSError:
+        return 0
+
+    total = 0
+    try:
+        for child in path.rglob("*"):
+            try:
+                if child.is_file() and not child.is_symlink():
+                    total += child.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return total
+    return total
+
+
+def _is_current_user_owned(path: Path) -> bool:
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return False
+    try:
+        return path.stat().st_uid == getuid()
+    except OSError:
+        return False
+
+
+def _is_safe_tmp_root_candidate(path: Path) -> bool:
+    try:
+        tmp_root = _TMP_ROOT.resolve()
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return resolved.parent == tmp_root and resolved.name.startswith("hermes-")
+
+
+def _is_stale_untracked_tmp_manifest(path: Path, now: datetime) -> bool:
+    if not path.is_dir() or path.is_symlink():
+        return False
+    if not any(token in path.name for token in _UNTRACKED_TMP_MANIFEST_NAMES):
+        return False
+    try:
+        age = now.timestamp() - path.stat().st_mtime
+    except OSError:
+        return False
+    return age > _UNTRACKED_TMP_MANIFEST_AGE_SECONDS
+
+
+def _is_stale_untracked_tmp_file(path: Path, now: datetime) -> bool:
+    if not path.is_file() or path.is_symlink():
+        return False
+    if any(path.name.startswith(prefix) for prefix in _PROTECTED_TMP_FILE_PREFIXES):
+        return False
+    try:
+        age = now.timestamp() - path.stat().st_mtime
+    except OSError:
+        return False
+    return age > _UNTRACKED_TMP_FILE_AGE_SECONDS
+
+
+def _contains_tracked_path(root: Path, tracked_paths: set[str]) -> bool:
+    for tracked_path in tracked_paths:
+        try:
+            Path(tracked_path).relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _iter_untracked_tmp_candidates(
+    tracked_paths: set[str],
+    now: datetime,
+) -> List[Tuple[Path, str, int]]:
+    """Return safe, untracked /tmp/hermes-* roots eligible for quick cleanup."""
+    try:
+        roots = list(_TMP_ROOT.glob("hermes-*"))
+    except OSError:
+        return []
+
+    candidates: List[Tuple[Path, str, int]] = []
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if str(resolved) in tracked_paths:
+            continue
+        if _contains_tracked_path(resolved, tracked_paths):
+            continue
+        if not _is_safe_tmp_root_candidate(resolved):
+            continue
+        if root.is_symlink() or not _is_current_user_owned(root):
+            continue
+        if _is_stale_untracked_tmp_manifest(root, now):
+            candidates.append((root, "tmp-manifest", _tree_size(root)))
+        elif _is_stale_untracked_tmp_file(root, now):
+            candidates.append((root, "tmp-file", _tree_size(root)))
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +475,26 @@ def quick() -> Dict[str, Any]:
                 new_tracked.append(item)
         else:
             new_tracked.append(item)
+
+    tracked_paths: set[str] = set()
+    for item in new_tracked:
+        try:
+            tracked_paths.add(str(Path(item["path"]).resolve()))
+        except OSError:
+            continue
+
+    for p, cat, size in _iter_untracked_tmp_candidates(tracked_paths, now):
+        try:
+            if p.is_file():
+                p.unlink()
+            elif p.is_dir():
+                shutil.rmtree(p)
+            freed += size
+            deleted += 1
+            _log(f"DELETED: {p} ({cat}, {fmt_size(size)})")
+        except OSError as e:
+            _log(f"ERROR deleting {p}: {e}")
+            errors.append(f"{p}: {e}")
 
     # Remove empty dirs under HERMES_HOME, but never recurse into known
     # durable state trees.  Some installs place the Hermes checkout, venv,
