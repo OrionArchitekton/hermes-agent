@@ -3273,8 +3273,9 @@ class SlackAdapter(BasePlatformAdapter):
         if timeout_raw:
             try:
                 parsed_timeout = int(timeout_raw)
-                if parsed_timeout > 0:
-                    timeout_ms = parsed_timeout
+                if parsed_timeout <= 0:
+                    raise ValueError("timeout must be positive")
+                timeout_ms = parsed_timeout
             except ValueError:
                 logger.warning(
                     "[Slack] Ignoring invalid SLACK_APPROVAL_DECISION_TIMEOUT_MS=%r",
@@ -3354,9 +3355,7 @@ class SlackAdapter(BasePlatformAdapter):
         }
         reason = value.get("reason")
         if isinstance(reason, str) and reason.strip():
-            payload["reason"] = self._required_approval_decision_text(
-                "reason", reason
-            )
+            payload["reason"] = reason.strip()
         return payload
 
     async def _post_approval_decision(

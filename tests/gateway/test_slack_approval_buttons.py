@@ -310,6 +310,21 @@ class TestSlackInteractiveAuth:
 
 
 class TestSlackApprovalDecisionAction:
+    def test_logs_non_positive_approval_timeout(self, monkeypatch, caplog):
+        adapter = _make_adapter()
+        monkeypatch.setenv("SLACK_APPROVAL_DECISION_TIMEOUT_MS", "0")
+
+        config = adapter._approval_decision_config_from_env()
+
+        assert (
+            config["timeout_ms"]
+            == slack_adapter_mod.DEFAULT_APPROVAL_DECISION_TIMEOUT_MS
+        )
+        assert any(
+            "Ignoring invalid SLACK_APPROVAL_DECISION_TIMEOUT_MS" in record.message
+            for record in caplog.records
+        )
+
     @pytest.mark.asyncio
     async def test_acknowledges_and_fails_closed_without_receiver_config(
         self, monkeypatch
@@ -385,6 +400,33 @@ class TestSlackApprovalDecisionAction:
         }
         assert config["url"] == "http://approvals-store:8091/decision"
         assert config["token"] == "receiver-token"
+
+    def test_approval_decision_payload_allows_multiline_reason(self):
+        adapter = _make_adapter()
+        body = {
+            "message": {"ts": "1720390000.000100"},
+            "channel": {"id": "COPS"},
+            "user": {"name": "dan", "id": "U_DAN"},
+        }
+        action = {
+            "action_id": "approval_decision:reject",
+            "value": json.dumps(
+                {
+                    "approval_id": "appr-linkedin-001",
+                    "flow": "linkedin-comment",
+                    "target": "linkedin:comment:post-123",
+                    "reason": "  first line\nsecond line  ",
+                }
+            ),
+        }
+
+        payload = adapter._build_approval_decision_payload(
+            body,
+            action,
+            {"action_prefix": "approval_decision:"},
+        )
+
+        assert payload["reason"] == "first line\nsecond line"
 
     @pytest.mark.asyncio
     async def test_blocks_unauthorized_approval_decision(self, monkeypatch):
