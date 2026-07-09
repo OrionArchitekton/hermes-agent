@@ -8,6 +8,7 @@ references:
   - gateway/shutdown_forensics.py
   - hermes_cli/gateway.py
   - tests/gateway/test_runner_startup_failures.py
+  - tests/hermes_cli/test_gateway_service.py
 ---
 
 # Hermes Gateway Systemd SIGTERM Exit
@@ -21,6 +22,11 @@ If `MAINPID` is a wrapper such as `doppler`, the helper resolves the Python
 gateway child and writes the marker for the process that will run the signal
 handler. That stop is intentional and must drain cleanly instead of returning a
 process failure.
+
+The service refresh path also disables stale current-service `ExecStart`
+drop-ins whose Python virtualenv is rooted outside the current Hermes checkout.
+Those files are renamed to `.disabled-<timestamp>` before daemon reload, not
+deleted, so rollback remains a file rename.
 
 ## Expected Behavior
 
@@ -52,6 +58,9 @@ Expected result: the service restarts and remains active without a new
 `status=1/FAILURE` or `Failed with result 'exit-code'` line for the controlled
 restart window, and the installed unit contains
 `ExecStop=-/bin/sh -c 'exec ... -m gateway.systemd_planned_stop "$MAINPID"'`.
+The effective unit must not include an active `*.conf` drop-in whose
+`ExecStart` points at a retired checkout such as
+`/home/hermes/.hermes/hermes-agent/venv/bin/python`.
 
 ## Rollback
 
@@ -59,6 +68,10 @@ Deploy the previous Hermes Agent release and restart `hermes-gateway.service`.
 If a rollback reintroduces nonzero controlled-restart exits, treat those journal
 lines as known restart-noise only for the rollback window and restore this fix
 before relying on gateway failure counts.
+
+If rollback specifically needs a disabled drop-in, rename the matching
+`*.disabled-<timestamp>` file back to `.conf`, run
+`systemctl --user daemon-reload`, then restart the gateway.
 
 ## Durable Lesson
 
