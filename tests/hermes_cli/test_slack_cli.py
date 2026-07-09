@@ -1,8 +1,10 @@
 """Tests for Slack CLI helpers."""
 
 import argparse
+import json
+from argparse import Namespace
 
-from hermes_cli.slack_cli import _build_full_manifest
+from hermes_cli.slack_cli import _build_full_manifest, slack_manifest_command
 from hermes_cli.subcommands.slack import build_slack_parser
 
 
@@ -24,7 +26,6 @@ class TestSlackManifestArgparse:
     def test_no_assistant_flag_sets_true(self):
         args = _parse_slack_args(["slack", "manifest", "--no-assistant"])
         assert args.no_assistant is True
-
 
 
 class TestSlackFullManifest:
@@ -112,3 +113,49 @@ class TestSlackFullManifest:
         bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
         for event in ("message.im", "message.channels", "message.groups", "app_mention"):
             assert event in bot_events
+
+    def test_custom_request_url_reaches_native_slashes(self):
+        manifest = _build_full_manifest(
+            "Hermes",
+            "Your Hermes agent on Slack",
+            request_url="https://ops.example.com/slack/commands",
+        )
+
+        slash_urls = {
+            command["url"] for command in manifest["features"]["slash_commands"]
+        }
+        assert slash_urls == {"https://ops.example.com/slack/commands"}
+
+    def test_interactivity_request_url_is_optional(self):
+        manifest = _build_full_manifest(
+            "Hermes",
+            "Your Hermes agent on Slack",
+            interactivity_request_url="https://ops.example.com/slack/actions",
+        )
+
+        assert manifest["settings"]["interactivity"] == {
+            "is_enabled": True,
+            "request_url": "https://ops.example.com/slack/actions",
+        }
+
+
+class TestSlackManifestCommand:
+    """CLI command output for `hermes slack manifest`."""
+
+    def test_slashes_only_uses_custom_request_url(self, capsys):
+        result = slack_manifest_command(
+            Namespace(
+                name=None,
+                description=None,
+                request_url="https://ops.example.com/slack/commands",
+                interactivity_request_url=None,
+                slashes_only=True,
+                write=None,
+            )
+        )
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert {entry["url"] for entry in payload} == {
+            "https://ops.example.com/slack/commands"
+        }
