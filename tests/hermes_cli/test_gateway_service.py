@@ -129,6 +129,65 @@ class TestSystemdServiceRefresh:
         assert not list(dropin_dir.glob("*.disabled-*"))
         assert calls == []
 
+    def test_refresh_sanitizes_stale_gateway_path_dropin_when_execstart_current(
+        self, tmp_path, monkeypatch
+    ):
+        current_root = tmp_path / "hermes-agent-v31"
+        retired_root = tmp_path / ".hermes" / "hermes-agent"
+        hermes_home = tmp_path / ".hermes"
+        current_root.mkdir()
+        retired_root.mkdir(parents=True)
+        home_node_bin = hermes_home / "node_modules" / ".bin"
+        home_node_bin.mkdir(parents=True)
+
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_text = "[Service]\nExecStart=/current/python -m hermes_cli.main gateway run\n"
+        unit_path.write_text(unit_text, encoding="utf-8")
+        dropin_dir = tmp_path / "hermes-gateway.service.d"
+        dropin_dir.mkdir()
+        current_dropin = dropin_dir / "95-upgrade-v31.conf"
+        stale_node_bin = retired_root / "node_modules" / ".bin"
+        current_dropin.write_text(
+            "[Service]\n"
+            "ExecStart=\n"
+            f"ExecStart=/usr/bin/doppler run -- {current_root}/venv/bin/python "
+            "-m hermes_cli.main gateway run --replace\n"
+            f'Environment="PATH={current_root}/venv/bin:{stale_node_bin}:'
+            f'{home_node_bin}:/usr/bin"\n',
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", current_root)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_systemd_unit",
+            lambda system=False, run_as_user=None: unit_text,
+        )
+
+        calls = []
+
+        def fake_run(cmd, check=True, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli.refresh_systemd_unit_if_needed(system=False) is True
+        sanitized = current_dropin.read_text(encoding="utf-8")
+        assert current_dropin.exists()
+        assert f"{stale_node_bin}" not in sanitized
+        assert f"{current_root}/venv/bin" in sanitized
+        assert f"{home_node_bin}" in sanitized
+        assert "/usr/bin" in sanitized
+        backups = list(dropin_dir.glob("95-upgrade-v31.conf.path-bak-*"))
+        assert len(backups) == 1
+        assert f"{stale_node_bin}" in backups[0].read_text(encoding="utf-8")
+        assert ["systemctl", "--user", "daemon-reload"] in calls
+
     def test_refresh_keeps_current_dropin_when_project_root_is_site_packages(
         self, tmp_path, monkeypatch
     ):

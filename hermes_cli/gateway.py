@@ -2976,9 +2976,124 @@ def _stale_gateway_execstart_dropins(unit_path: Path) -> list[Path]:
     return stale
 
 
+def _gateway_node_bin_project_root(path: str) -> Path | None:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        return None
+    if candidate.name != ".bin" or candidate.parent.name != "node_modules":
+        return None
+    return _safe_resolve(candidate.parent.parent)
+
+
+def _is_stale_gateway_node_bin_path(
+    entry: str,
+    *,
+    current_roots: set[Path],
+    hermes_home: Path,
+) -> bool:
+    root = _gateway_node_bin_project_root(entry)
+    if root is None:
+        return False
+    try:
+        home_node_bin = _safe_resolve(hermes_home / "node_modules" / ".bin")
+    except (OSError, RuntimeError, ValueError):
+        home_node_bin = hermes_home / "node_modules" / ".bin"
+    if _safe_resolve(Path(entry)) == home_node_bin:
+        return False
+    return root not in current_roots
+
+
+def _systemd_quote_environment_assignment(assignment: str) -> str:
+    escaped = assignment.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _sanitize_gateway_path_environment_line(
+    line: str,
+    *,
+    current_roots: set[Path],
+    hermes_home: Path,
+) -> tuple[str, bool]:
+    stripped = line.lstrip()
+    indent = line[: len(line) - len(stripped)]
+    if not stripped.startswith("Environment="):
+        return line, False
+
+    body = stripped[len("Environment=") :].strip()
+    if not body:
+        return line, False
+
+    try:
+        assignments = shlex.split(body)
+    except ValueError:
+        return line, False
+
+    changed = False
+    sanitized_assignments: list[str] = []
+    for assignment in assignments:
+        if not assignment.startswith("PATH="):
+            sanitized_assignments.append(assignment)
+            continue
+
+        value = assignment.split("=", 1)[1]
+        entries = value.split(":")
+        filtered_entries = []
+        for entry in entries:
+            if _is_stale_gateway_node_bin_path(
+                entry,
+                current_roots=current_roots,
+                hermes_home=hermes_home,
+            ):
+                changed = True
+                continue
+            filtered_entries.append(entry)
+        sanitized_assignments.append(f"PATH={':'.join(filtered_entries)}")
+
+    if not changed:
+        return line, False
+
+    rendered = " ".join(
+        _systemd_quote_environment_assignment(assignment)
+        for assignment in sanitized_assignments
+    )
+    return f"{indent}Environment={rendered}", True
+
+
+def _sanitize_gateway_path_environment_dropin(text: str) -> tuple[str, bool]:
+    current_roots = _current_gateway_project_roots()
+    hermes_home = get_hermes_home()
+    changed = False
+    sanitized_lines = []
+    for line in text.splitlines():
+        sanitized_line, line_changed = _sanitize_gateway_path_environment_line(
+            line,
+            current_roots=current_roots,
+            hermes_home=hermes_home,
+        )
+        sanitized_lines.append(sanitized_line)
+        changed = changed or line_changed
+    if not changed:
+        return text, False
+    sanitized = "\n".join(sanitized_lines)
+    if text.endswith("\n"):
+        sanitized += "\n"
+    return sanitized, True
+
+
 def _disabled_dropin_path(path: Path) -> Path:
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     base = path.with_name(f"{path.name}.disabled-{stamp}")
+    candidate = base
+    suffix = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{base.name}.{suffix}")
+        suffix += 1
+    return candidate
+
+
+def _dropin_backup_path(path: Path, marker: str) -> Path:
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    base = path.with_name(f"{path.name}.{marker}-{stamp}")
     candidate = base
     suffix = 1
     while candidate.exists():
@@ -3001,6 +3116,37 @@ def _disable_stale_gateway_execstart_dropins(system: bool = False) -> list[Path]
         print_warning(f"Disabled stale gateway systemd drop-in: {dropin} -> {target}")
         disabled.append(target)
     return disabled
+
+
+def _sanitize_stale_gateway_path_dropins(system: bool = False) -> list[Path]:
+    """Remove retired project node_modules paths from current-service drop-ins."""
+    unit_path = get_systemd_unit_path(system=system)
+    dropin_dir = _systemd_dropin_dir(unit_path)
+    if not dropin_dir.is_dir():
+        return []
+
+    sanitized: list[Path] = []
+    for dropin in sorted(dropin_dir.glob("*.conf")):
+        try:
+            original = dropin.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, PermissionError):
+            continue
+        updated, changed = _sanitize_gateway_path_environment_dropin(original)
+        if not changed:
+            continue
+        backup = _dropin_backup_path(dropin, "path-bak")
+        try:
+            backup.write_text(original, encoding="utf-8")
+            dropin.write_text(updated, encoding="utf-8")
+        except OSError as exc:
+            print_warning(f"Could not sanitize stale gateway PATH in {dropin}: {exc}")
+            continue
+        print_warning(
+            f"Removed stale gateway node_modules PATH entry from {dropin} "
+            f"(backup: {backup})"
+        )
+        sanitized.append(dropin)
+    return sanitized
 
 
 def _temp_home_in_service_definition(definition: str) -> str | None:
@@ -3103,12 +3249,20 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
             return False
 
     disabled_dropins = _disable_stale_gateway_execstart_dropins(system=system)
+    sanitized_path_dropins = _sanitize_stale_gateway_path_dropins(system=system)
     if unit_current:
-        if disabled_dropins:
+        if disabled_dropins or sanitized_path_dropins:
             _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
-            print(
-                f"↻ Disabled stale gateway {_service_scope_label(system)} systemd drop-in(s)"
-            )
+            if disabled_dropins:
+                print(
+                    f"↻ Disabled stale gateway {_service_scope_label(system)} "
+                    "systemd drop-in(s)"
+                )
+            if sanitized_path_dropins:
+                print(
+                    f"↻ Sanitized stale gateway {_service_scope_label(system)} "
+                    "systemd PATH drop-in(s)"
+                )
             return True
         return False
 
