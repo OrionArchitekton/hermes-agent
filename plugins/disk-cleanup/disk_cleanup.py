@@ -221,8 +221,11 @@ def _tree_size(path: Path) -> int:
 
 
 def _is_current_user_owned(path: Path) -> bool:
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return False
     try:
-        return path.stat().st_uid == os.getuid()
+        return path.stat().st_uid == getuid()
     except OSError:
         return False
 

@@ -456,6 +456,29 @@ class TestTrackForgetQuick:
         assert summary["deleted"] == 0
         assert manifest_dir.exists()
 
+    def test_quick_preserves_untracked_tmp_manifest_without_uid_guard(
+        self, _isolate_env, tmp_path, monkeypatch
+    ):
+        dg = _load_lib()
+        tmp_root = tmp_path / "tmp"
+        tmp_root.mkdir()
+        monkeypatch.setattr(dg, "_TMP_ROOT", tmp_root, raising=False)
+        monkeypatch.delattr(dg.os, "getuid", raising=False)
+
+        manifest_dir = tmp_root / "hermes-slack-command-center-manifest-no-uid"
+        manifest_dir.mkdir()
+        payload = manifest_dir / "payload.bin"
+        payload.write_bytes(b"x" * 128)
+
+        old = (datetime.now(timezone.utc) - timedelta(hours=13)).timestamp()
+        os.utime(payload, (old, old))
+        os.utime(manifest_dir, (old, old))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert manifest_dir.exists()
+
 
 class TestStatus:
     def test_empty_status(self, _isolate_env):
