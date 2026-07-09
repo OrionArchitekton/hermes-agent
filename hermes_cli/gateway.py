@@ -5040,12 +5040,6 @@ def _job_targets_platform(job: dict, platform_name: str) -> bool:
             origin = job.get("origin") or {}
             if str(origin.get("platform") or "").lower() == platform_key:
                 return True
-        if (
-            target == "all"
-            and platform_key
-            in _compact_status_text(job.get("last_delivery_error")).lower()
-        ):
-            return True
     return False
 
 

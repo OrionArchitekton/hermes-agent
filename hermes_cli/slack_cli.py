@@ -21,7 +21,6 @@ for reinstall when scopes/commands change.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -190,11 +189,13 @@ def slack_manifest_command(args) -> int:
                 from hermes_constants import get_hermes_home
 
                 target = Path(get_hermes_home()) / "slack-manifest.json"
-            except Exception:
-                target = (
-                    Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes"))
-                    / "slack-manifest.json"
+            except Exception as exc:
+                print(
+                    "Could not resolve Hermes home for default --write target; "
+                    "pass an explicit manifest path.",
+                    file=sys.stderr,
                 )
+                raise RuntimeError("Hermes home resolution failed") from exc
         else:
             target = Path(write_target).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)

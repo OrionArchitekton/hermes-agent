@@ -38,6 +38,8 @@ When one or more cron jobs target Slack and have a `last_delivery_error`,
 Acceptance:
 - Jobs with `deliver=slack`, `deliver=slack:<target>`, or `deliver=origin` from
   a Slack origin are counted.
+- Jobs with `deliver=all` are not inferred from error text; they need an
+  explicit Slack delivery target or Slack origin to count.
 - Non-Slack delivery failures are not included in the Slack summary.
 - Cron storage read failures do not break gateway status output.
 

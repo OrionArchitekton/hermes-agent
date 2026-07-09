@@ -64,6 +64,13 @@ def test_runtime_health_lines_include_slack_cron_delivery_failures(monkeypatch):
                 "last_delivery_error": "delivery to telegram failed",
             },
             {
+                "id": "broadcast-digest",
+                "name": "broadcast digest",
+                "deliver": "all",
+                "last_run_at": "2026-07-07T20:01:30Z",
+                "last_delivery_error": "delivery to slack failed in broadcast fanout",
+            },
+            {
                 "id": "slack-origin",
                 "name": "approval loop",
                 "deliver": "origin",
