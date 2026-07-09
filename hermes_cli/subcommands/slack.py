@@ -52,6 +52,23 @@ def build_slack_parser(subparsers, *, cmd_slack: Callable) -> None:
         help="Bot description shown in Slack's app directory.",
     )
     slack_manifest.add_argument(
+        "--request-url",
+        default=None,
+        help=(
+            "Slash-command request URL to write into the manifest. Socket "
+            "Mode ignores this URL, but Slack still requires one in each "
+            "slash command entry."
+        ),
+    )
+    slack_manifest.add_argument(
+        "--interactivity-request-url",
+        default=None,
+        help=(
+            "Optional request URL for Slack interactivity and Block Kit "
+            "actions when the app is not relying only on Socket Mode."
+        ),
+    )
+    slack_manifest.add_argument(
         "--slashes-only",
         action="store_true",
         help="Emit only the features.slash_commands array (for merging "

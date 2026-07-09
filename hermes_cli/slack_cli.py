@@ -1,8 +1,8 @@
 """``hermes slack ...`` CLI subcommands.
 
-Today only ``hermes slack manifest`` is implemented — it generates the
+Today only ``hermes slack manifest`` is implemented - it generates the
 Slack app manifest JSON for registering every gateway command as a native
-Slack slash (``/btw``, ``/stop``, ``/model``, …) so users get the same
+Slack slash (``/btw``, ``/stop``, ``/model``, ...) so users get the same
 first-class slash UX Discord and Telegram already have.
 
 Typical workflow::
@@ -10,11 +10,14 @@ Typical workflow::
     $ hermes slack manifest > slack-manifest.json
     # or:
     $ hermes slack manifest --write
+    # or for an HTTP-routed command-center app:
+    $ hermes slack manifest --request-url https://ops.example.com/slack/commands
 
 Then paste the printed JSON into the Slack app config (Features → App
 Manifest → Edit) and click Save. Slack diffs the manifest and prompts
 for reinstall when scopes/commands change.
 """
+
 from __future__ import annotations
 
 import json
@@ -22,12 +25,16 @@ import os
 import sys
 from pathlib import Path
 
+_DEFAULT_SLACK_REQUEST_URL = "https://hermes-agent.local/slack/commands"
 
 def _build_full_manifest(
     bot_name: str,
     bot_description: str,
+    *,
     include_assistant: bool = True,
     messaging_experience: str | None = None,
+    request_url: str = _DEFAULT_SLACK_REQUEST_URL,
+    interactivity_request_url: str | None = None,
 ) -> dict:
     """Build a full Slack manifest merging display info + our slash list.
 
@@ -55,8 +62,13 @@ def _build_full_manifest(
             "messaging_experience must be one of: assistant, agent, none"
         )
 
-    partial = slack_app_manifest()
+    partial = slack_app_manifest(request_url=request_url)
     slashes = partial["features"]["slash_commands"]
+    interactivity = {
+        "is_enabled": True,
+    }
+    if interactivity_request_url:
+        interactivity["request_url"] = interactivity_request_url
 
     features = {
         "app_home": {
@@ -141,9 +153,7 @@ def _build_full_manifest(
             "event_subscriptions": {
                 "bot_events": bot_events,
             },
-            "interactivity": {
-                "is_enabled": True,
-            },
+            "interactivity": interactivity,
             "org_deploy_enabled": False,
             "socket_mode_enabled": True,
             "token_rotation_enabled": False,
@@ -159,6 +169,8 @@ def slack_manifest_command(args) -> int:
                       ``$HERMES_HOME/slack-manifest.json``)
       --name NAME     Override the bot display name (default: "Hermes")
       --description DESC  Override the bot description
+      --request-url URL  Override the slash-command URL in every manifest entry
+      --interactivity-request-url URL  Include an interactivity request URL
       --slashes-only  Emit only the ``features.slash_commands`` array (for
                       merging into an existing manifest manually)
       --no-assistant  Omit Slack AI Assistant mode (assistant_view feature,
@@ -177,16 +189,22 @@ def slack_manifest_command(args) -> int:
         messaging_experience = "none"
     else:
         messaging_experience = "assistant"
+    request_url = getattr(args, "request_url", None) or _DEFAULT_SLACK_REQUEST_URL
+    interactivity_request_url = getattr(args, "interactivity_request_url", None)
 
     if getattr(args, "slashes_only", False):
         from hermes_cli.commands import slack_app_manifest
 
-        manifest = slack_app_manifest()["features"]["slash_commands"]
+        manifest = slack_app_manifest(request_url=request_url)["features"][
+            "slash_commands"
+        ]
     else:
         manifest = _build_full_manifest(
             name,
             description,
             messaging_experience=messaging_experience,
+            request_url=request_url,
+            interactivity_request_url=interactivity_request_url,
         )
 
     payload = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
@@ -200,7 +218,10 @@ def slack_manifest_command(args) -> int:
 
                 target = Path(get_hermes_home()) / "slack-manifest.json"
             except Exception:
-                target = Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")) / "slack-manifest.json"
+                target = (
+                    Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes"))
+                    / "slack-manifest.json"
+                )
         else:
             target = Path(write_target).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
