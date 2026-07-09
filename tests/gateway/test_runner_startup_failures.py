@@ -561,19 +561,10 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
     assert exc_info.value.code == GATEWAY_FATAL_CONFIG_EXIT_CODE
 
 
-@pytest.mark.asyncio
-async def test_start_gateway_exits_cleanly_on_systemd_sigterm(
-    monkeypatch, tmp_path
-):
-    """systemd-managed restarts must not look like process crashes.
-
-    Hermes-01 runs the gateway under ``hermes-gateway.service`` with systemd
-    sending SIGTERM during an operator restart. Before this regression fix, the
-    unmarked signal path returned False from start_gateway(), so journalctl
-    recorded ``status=1/FAILURE`` even though the stop was intentional.
-    """
+async def _run_start_gateway_until_sigterm(monkeypatch, tmp_path, *, planned_stop, shutdown_ctx):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     handlers = {}
+    runner_ref = {}
 
     class _SignalExitRunner:
         def __init__(self, config):
@@ -587,6 +578,7 @@ async def test_start_gateway_exits_cleanly_on_systemd_sigterm(
             self._restart_via_service = False
             self._signal_initiated_shutdown = False
             self._stopped = asyncio.Event()
+            runner_ref["runner"] = self
 
         async def start(self):
             cb, args = handlers[signal.SIGTERM]
@@ -620,16 +612,10 @@ async def test_start_gateway_exits_cleanly_on_systemd_sigterm(
     monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
     monkeypatch.setattr("gateway.run.GatewayRunner", _SignalExitRunner)
     monkeypatch.setattr("gateway.status.consume_takeover_marker_for_self", lambda: False)
-    monkeypatch.setattr("gateway.status.consume_planned_stop_marker_for_self", lambda: False)
+    monkeypatch.setattr("gateway.status.consume_planned_stop_marker_for_self", lambda: planned_stop)
     monkeypatch.setattr(
         "gateway.shutdown_forensics.snapshot_shutdown_context",
-        lambda received_signal: {
-            "signal": "SIGTERM",
-            "signal_num": int(received_signal),
-            "under_systemd": True,
-            "parent_pid": 1,
-            "parent_name": "systemd",
-        },
+        lambda received_signal: shutdown_ctx,
     )
     monkeypatch.setattr(
         "gateway.shutdown_forensics.format_context_for_log",
@@ -640,19 +626,61 @@ async def test_start_gateway_exits_cleanly_on_systemd_sigterm(
     from gateway.run import start_gateway
 
     ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+    return ok, runner_ref["runner"]
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_exits_cleanly_on_systemd_sigterm_with_planned_marker(
+    monkeypatch, tmp_path
+):
+    """systemd stops are clean only after the unit marks them planned.
+
+    Hermes-01 runs the gateway under ``hermes-gateway.service``. The generated
+    unit's ExecStop writes the planned-stop marker before systemd sends SIGTERM,
+    so a controlled service restart does not show up as ``status=1/FAILURE``.
+    """
+    ok, runner = await _run_start_gateway_until_sigterm(
+        monkeypatch,
+        tmp_path,
+        planned_stop=True,
+        shutdown_ctx={
+            "signal": "SIGTERM",
+            "signal_num": int(signal.SIGTERM),
+            "under_systemd": True,
+            "parent_pid": 1,
+            "parent_name": "systemd",
+        },
+    )
 
     assert ok is True
+    assert runner._signal_initiated_shutdown is False
 
 
-def test_non_systemd_sigterm_is_not_classified_as_managed_restart():
-    from gateway.run import _is_systemd_managed_sigterm
+@pytest.mark.asyncio
+async def test_unmarked_systemd_sigterm_remains_signal_initiated_shutdown(
+    monkeypatch, tmp_path
+):
+    """Being launched by systemd is not proof systemd sent the signal.
 
-    assert _is_systemd_managed_sigterm(
-        signal.SIGTERM,
-        {"signal": "SIGTERM", "under_systemd": False},
-    ) is False
-    assert _is_systemd_managed_sigterm(signal.SIGINT, {"under_systemd": True}) is False
-    assert _is_systemd_managed_sigterm(signal.SIGTERM, None) is False
+    A bare ``kill -TERM <gateway-pid>`` against a systemd-managed gateway has
+    the same ``under_systemd`` shutdown context as an operator restart. Without
+    the planned-stop marker it must stay on the crash-recovery path.
+    """
+    ok, runner = await _run_start_gateway_until_sigterm(
+        monkeypatch,
+        tmp_path,
+        planned_stop=False,
+        shutdown_ctx={
+            "signal": "SIGTERM",
+            "signal_num": int(signal.SIGTERM),
+            "under_systemd": True,
+            "parent_pid": 1,
+            "parent_name": "systemd",
+        },
+    )
+
+    assert ok is False
+    assert runner._signal_initiated_shutdown is True
 
 
 def test_runner_warns_when_docker_gateway_lacks_explicit_output_mount(monkeypatch, tmp_path, caplog):
