@@ -2875,6 +2875,92 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     return norm_installed == norm_expected
 
 
+def _systemd_dropin_dir(unit_path: Path) -> Path:
+    return unit_path.with_name(f"{unit_path.name}.d")
+
+
+def _safe_resolve(path: Path) -> Path:
+    try:
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return path
+
+
+def _gateway_execstart_python_roots(definition: str) -> list[Path]:
+    roots: list[Path] = []
+    for raw_line in definition.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("ExecStart=") or line == "ExecStart=":
+            continue
+        if not any(marker in line for marker in _LEGACY_UNIT_EXECSTART_MARKERS):
+            continue
+        value = line.split("=", 1)[1]
+        try:
+            tokens = shlex.split(value)
+        except ValueError:
+            tokens = value.split()
+        for token in tokens:
+            candidate = Path(token)
+            if not candidate.is_absolute():
+                continue
+            if not candidate.name.startswith("python"):
+                continue
+            bin_dir = candidate.parent
+            venv_dir = bin_dir.parent
+            if bin_dir.name != "bin" or venv_dir.name not in {"venv", ".venv"}:
+                continue
+            roots.append(_safe_resolve(venv_dir.parent))
+    return roots
+
+
+def _stale_gateway_execstart_dropins(unit_path: Path) -> list[Path]:
+    dropin_dir = _systemd_dropin_dir(unit_path)
+    if not dropin_dir.is_dir():
+        return []
+
+    current_root = _safe_resolve(PROJECT_ROOT)
+    stale: list[Path] = []
+    for dropin in sorted(dropin_dir.glob("*.conf")):
+        try:
+            text = dropin.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, PermissionError):
+            continue
+        roots = _gateway_execstart_python_roots(text)
+        if not roots:
+            continue
+        if any(root == current_root for root in roots):
+            continue
+        stale.append(dropin)
+    return stale
+
+
+def _disabled_dropin_path(path: Path) -> Path:
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    base = path.with_name(f"{path.name}.disabled-{stamp}")
+    candidate = base
+    suffix = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{base.name}.{suffix}")
+        suffix += 1
+    return candidate
+
+
+def _disable_stale_gateway_execstart_dropins(system: bool = False) -> list[Path]:
+    """Disable current-service drop-ins whose ExecStart targets another checkout."""
+    unit_path = get_systemd_unit_path(system=system)
+    disabled: list[Path] = []
+    for dropin in _stale_gateway_execstart_dropins(unit_path):
+        target = _disabled_dropin_path(dropin)
+        try:
+            dropin.rename(target)
+        except OSError as exc:
+            print_warning(f"Could not disable stale gateway systemd drop-in {dropin}: {exc}")
+            continue
+        print_warning(f"Disabled stale gateway systemd drop-in: {dropin} -> {target}")
+        disabled.append(target)
+    return disabled
+
+
 def _temp_home_in_service_definition(definition: str) -> str | None:
     """Return the temp-dir HERMES_HOME baked into a service definition, or None.
 
@@ -2937,37 +3023,51 @@ def _refuse_temp_home_service_write(definition: str, kind: str) -> bool:
 def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     """Rewrite the installed systemd unit when the generated definition has changed."""
     unit_path = get_systemd_unit_path(system=system)
-    if not unit_path.exists() or systemd_unit_is_current(system=system):
+    if not unit_path.exists():
         return False
 
-    expected_user = _read_systemd_user_from_unit(unit_path) if system else None
-    new_unit = generate_systemd_unit(system=system, run_as_user=expected_user)
+    unit_current = systemd_unit_is_current(system=system)
+    new_unit = ""
+    expected_user = None
+    if not unit_current:
+        expected_user = _read_systemd_user_from_unit(unit_path) if system else None
+        new_unit = generate_systemd_unit(system=system, run_as_user=expected_user)
 
-    # ── Test-environment safety belt ─────────────────────────────────────
-    # The user-scope unit path resolves under ``Path.home()``, which is NOT
-    # sandboxed by the test conftest (only HERMES_HOME is). If a test
-    # exercises ``run_gateway()`` with a pytest-tmp HERMES_HOME, the freshly
-    # generated unit bakes that ``/tmp/pytest-of-.../hermes_test`` path into
-    # ``Environment="HERMES_HOME=..."``. Writing that to the developer's
-    # real user systemd unit file silently breaks their gateway on the next
-    # reboot (systemd loads the polluted env, the gateway looks at an empty
-    # tmp dir, and Telegram/Discord/etc. all show as "not configured").
-    # Refuse to write when the generated unit references a pytest tmpdir.
-    # Detection sniffs the unit body — tests that legitimately exercise the
-    # refresh flow patch ``generate_systemd_unit`` to return synthetic
-    # content (``"new unit\n"``) which doesn't contain these markers and
-    # still works.
-    if not system and (
-        "/pytest-of-" in new_unit
-        or '/hermes_test"' in new_unit
-        or "/hermes_test/" in new_unit
-    ):
-        return False
+        # ── Test-environment safety belt ─────────────────────────────────────
+        # The user-scope unit path resolves under ``Path.home()``, which is NOT
+        # sandboxed by the test conftest (only HERMES_HOME is). If a test
+        # exercises ``run_gateway()`` with a pytest-tmp HERMES_HOME, the freshly
+        # generated unit bakes that ``/tmp/pytest-of-.../hermes_test`` path into
+        # ``Environment="HERMES_HOME=..."``. Writing that to the developer's
+        # real user systemd unit file silently breaks their gateway on the next
+        # reboot (systemd loads the polluted env, the gateway looks at an empty
+        # tmp dir, and Telegram/Discord/etc. all show as "not configured").
+        # Refuse to write when the generated unit references a pytest tmpdir.
+        # Detection sniffs the unit body — tests that legitimately exercise the
+        # refresh flow patch ``generate_systemd_unit`` to return synthetic
+        # content (``"new unit\n"``) which doesn't contain these markers and
+        # still works.
+        if not system and (
+            "/pytest-of-" in new_unit
+            or '/hermes_test"' in new_unit
+            or "/hermes_test/" in new_unit
+        ):
+            return False
 
-    # Structural variant of the same belt: refuse to bake ANY temp-dir
-    # HERMES_HOME into the unit (manual E2E homes like /tmp/hermes-e2e-NNN
-    # don't carry the pytest markers above but poison the unit identically).
-    if _refuse_temp_home_service_write(new_unit, "systemd unit"):
+        # Structural variant of the same belt: refuse to bake ANY temp-dir
+        # HERMES_HOME into the unit (manual E2E homes like /tmp/hermes-e2e-NNN
+        # don't carry the pytest markers above but poison the unit identically).
+        if _refuse_temp_home_service_write(new_unit, "systemd unit"):
+            return False
+
+    disabled_dropins = _disable_stale_gateway_execstart_dropins(system=system)
+    if unit_current:
+        if disabled_dropins:
+            _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
+            print(
+                f"↻ Disabled stale gateway {_service_scope_label(system)} systemd drop-in(s)"
+            )
+            return True
         return False
 
     unit_path.write_text(new_unit, encoding="utf-8")
