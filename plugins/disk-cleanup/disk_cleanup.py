@@ -166,6 +166,10 @@ _TMP_ROOT = Path("/tmp")
 _UNTRACKED_TMP_MANIFEST_AGE_SECONDS = 12 * 60 * 60
 _UNTRACKED_TMP_FILE_AGE_SECONDS = 24 * 60 * 60
 _UNTRACKED_TMP_MANIFEST_NAMES = ("manifest",)
+_PROTECTED_TMP_FILE_PREFIXES = (
+    "hermes-pty-active-",
+    "hermes-tui-active-session-",
+)
 
 
 def _is_protected_cron_path(p: Path) -> bool:
@@ -254,11 +258,23 @@ def _is_stale_untracked_tmp_manifest(path: Path, now: datetime) -> bool:
 def _is_stale_untracked_tmp_file(path: Path, now: datetime) -> bool:
     if not path.is_file() or path.is_symlink():
         return False
+    if any(path.name.startswith(prefix) for prefix in _PROTECTED_TMP_FILE_PREFIXES):
+        return False
     try:
         age = now.timestamp() - path.stat().st_mtime
     except OSError:
         return False
     return age > _UNTRACKED_TMP_FILE_AGE_SECONDS
+
+
+def _contains_tracked_path(root: Path, tracked_paths: set[str]) -> bool:
+    for tracked_path in tracked_paths:
+        try:
+            Path(tracked_path).relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def _iter_untracked_tmp_candidates(
@@ -278,6 +294,8 @@ def _iter_untracked_tmp_candidates(
         except OSError:
             continue
         if str(resolved) in tracked_paths:
+            continue
+        if _contains_tracked_path(resolved, tracked_paths):
             continue
         if not _is_safe_tmp_root_candidate(resolved):
             continue

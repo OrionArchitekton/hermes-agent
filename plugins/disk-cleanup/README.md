@@ -46,6 +46,10 @@ Deletion rules (same as the original PR):
 - `is_safe_path()` rejects anything outside `HERMES_HOME` or `/tmp/hermes-*`
 - Untracked `/tmp/hermes-*` sweeps only inspect direct `/tmp` children owned by
   the current user, never symlinks
+- Live TUI/dashboard active-session marker files are excluded from untracked
+  `/tmp/hermes-*` file cleanup
+- A temp manifest directory is excluded when any still-tracked path lives
+  inside it
 - Windows mounts (`/mnt/c` etc.) are rejected
 - The state directory `$HERMES_HOME/disk-cleanup/` is itself excluded
 - `$HERMES_HOME/logs/`, `memories/`, `sessions/`, `skills/`, `plugins/`,
