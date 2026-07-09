@@ -52,6 +52,8 @@ direct children of `/tmp`, so artifacts created outside the `write_file` /
   they are older than 12 hours.
 - Delete untracked `/tmp/hermes-*` files only after they are older than 24
   hours.
+- Preserve live active-session marker files and any manifest directory that
+  contains a still-tracked child path.
 - Include reclaimed bytes in the normal quick-cleanup summary.
 
 ## Verification
