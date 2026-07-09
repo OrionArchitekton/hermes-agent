@@ -22,6 +22,8 @@ Deletion rules (same as the original PR):
 |---|---|---|
 | `test` | every session end | Never |
 | `temp` | >7 days since tracked | Never |
+| untracked `/tmp/hermes-*-manifest-*` dirs | >12 hours since mtime | Never |
+| untracked `/tmp/hermes-*` files | >24 hours since mtime | Never |
 | `cron-output` | >14 days since tracked | Never |
 | empty dirs under HERMES_HOME | always | Never |
 | `research` | >30 days, beyond 10 newest | Always (deep only) |
@@ -42,6 +44,8 @@ Deletion rules (same as the original PR):
 ## Safety
 
 - `is_safe_path()` rejects anything outside `HERMES_HOME` or `/tmp/hermes-*`
+- Untracked `/tmp/hermes-*` sweeps only inspect direct `/tmp` children owned by
+  the current user, never symlinks
 - Windows mounts (`/mnt/c` etc.) are rejected
 - The state directory `$HERMES_HOME/disk-cleanup/` is itself excluded
 - `$HERMES_HOME/logs/`, `memories/`, `sessions/`, `skills/`, `plugins/`,
