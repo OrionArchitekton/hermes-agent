@@ -22389,6 +22389,15 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+def _is_systemd_managed_sigterm(received_signal, shutdown_ctx) -> bool:
+    """Return True when SIGTERM arrived while the gateway is under systemd."""
+    return (
+        received_signal == signal.SIGTERM
+        and bool(shutdown_ctx)
+        and bool(shutdown_ctx.get("under_systemd"))
+    )
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -22650,6 +22659,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)
 
+        systemd_managed_sigterm = (
+            not planned_takeover
+            and not planned_stop
+            and _is_systemd_managed_sigterm(received_signal, _shutdown_ctx)
+        )
+
         if planned_takeover:
             logger.info(
                 "Received %s as a planned --replace takeover — exiting cleanly",
@@ -22659,6 +22674,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logger.info(
                 "Received %s as a planned gateway stop — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
+            )
+        elif systemd_managed_sigterm:
+            logger.info(
+                "Received %s from systemd service manager — exiting cleanly",
+                _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM",
             )
         else:
             _signal_initiated_shutdown = True
@@ -22941,8 +22961,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     #   - hermes update killing the gateway mid-work
     #   - External kill commands
     #   - WSL2/container runtime sending unexpected signals
-    # `hermes gateway stop` and interactive Ctrl+C are handled above as
-    # planned stops and should not trigger service-manager revival.
+    # `hermes gateway stop`, interactive Ctrl+C, and systemd-managed SIGTERM
+    # are handled above as clean stops. In the systemd case the service manager
+    # already owns the stop/restart decision, so a managed restart should not
+    # be recorded as a process failure.
     if _signal_initiated_shutdown and not runner._restart_requested:
         logger.info(
             "Exiting with code 1 (signal-initiated shutdown without restart "

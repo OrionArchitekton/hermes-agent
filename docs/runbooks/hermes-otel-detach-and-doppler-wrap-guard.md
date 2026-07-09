@@ -28,10 +28,10 @@ Symptom: `ERROR opentelemetry.context: Failed to detach context` +
 ~/.hermes/logs/errors.log (26 events) and the journal, emitted when the langfuse
 plugin ends spans / flushes during async teardown (GeneratorExit). Known
 cross-framework bug (langfuse#8780/#8316; google/adk-python#860).
-NOTE: this is log/teardown NOISE. It is NOT the cause of the by-design nonzero
-exit on `gateway run --replace` restarts (every restart exits nonzero by design;
-see gateway-exit-diag.log `asyncio.run.returned success=false`). The win is
-restoring signal on the errors.log alerting surface.
+NOTE: this is log/teardown NOISE. It is not the cause of gateway restart exit
+status. Older Hermes builds emitted nonzero restart exits for systemd-managed
+SIGTERM, but that behavior was corrected on 2026-07-09; see
+`docs/runbooks/hermes-gateway-systemd-sigterm-exit.md`.
 
 Fix: plugins/observability/langfuse/__init__.py installs
 `_install_otel_detach_guard()` at import — wraps

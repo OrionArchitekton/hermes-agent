@@ -1,3 +1,6 @@
+import asyncio
+import signal
+
 import pytest
 from unittest.mock import AsyncMock
 
@@ -6,6 +9,14 @@ from gateway.platforms.base import BasePlatformAdapter
 from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
 from gateway.run import GatewayRunner
 from gateway.status import read_runtime_status
+
+
+class _NoopCronProvider:
+    def start(self, stop_event, *, adapters=None, loop=None):
+        return None
+
+    def stop(self):
+        return None
 
 
 class _RetryableFailureAdapter(BasePlatformAdapter):
@@ -548,6 +559,100 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
         await start_gateway(config=GatewayConfig(), replace=False, verbosity=0)
 
     assert exc_info.value.code == GATEWAY_FATAL_CONFIG_EXIT_CODE
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_exits_cleanly_on_systemd_sigterm(
+    monkeypatch, tmp_path
+):
+    """systemd-managed restarts must not look like process crashes.
+
+    Hermes-01 runs the gateway under ``hermes-gateway.service`` with systemd
+    sending SIGTERM during an operator restart. Before this regression fix, the
+    unmarked signal path returned False from start_gateway(), so journalctl
+    recorded ``status=1/FAILURE`` even though the stop was intentional.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    handlers = {}
+
+    class _SignalExitRunner:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit_cleanly = False
+            self.should_exit_with_failure = False
+            self.exit_reason = None
+            self.exit_code = None
+            self.adapters = {}
+            self._restart_requested = False
+            self._restart_via_service = False
+            self._signal_initiated_shutdown = False
+            self._stopped = asyncio.Event()
+
+        async def start(self):
+            cb, args = handlers[signal.SIGTERM]
+            asyncio.get_running_loop().call_soon(cb, *args)
+            return True
+
+        async def stop(self):
+            self._stopped.set()
+
+        async def wait_for_shutdown(self):
+            await self._stopped.wait()
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(
+        loop,
+        "add_signal_handler",
+        lambda sig, cb, *args: handlers.__setitem__(sig, (cb, args)),
+    )
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("gateway.status.write_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.acquire_gateway_runtime_lock", lambda: True)
+    monkeypatch.setattr("gateway.status.release_gateway_runtime_lock", lambda: None)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: None)
+    monkeypatch.setattr("tools.mcp_tool.shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: _NoopCronProvider())
+    monkeypatch.setattr("gateway.run._start_gateway_housekeeping", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gateway.run._run_planned_stop_watcher", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gateway.run.GatewayRunner", _SignalExitRunner)
+    monkeypatch.setattr("gateway.status.consume_takeover_marker_for_self", lambda: False)
+    monkeypatch.setattr("gateway.status.consume_planned_stop_marker_for_self", lambda: False)
+    monkeypatch.setattr(
+        "gateway.shutdown_forensics.snapshot_shutdown_context",
+        lambda received_signal: {
+            "signal": "SIGTERM",
+            "signal_num": int(received_signal),
+            "under_systemd": True,
+            "parent_pid": 1,
+            "parent_name": "systemd",
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.shutdown_forensics.format_context_for_log",
+        lambda ctx: "signal=SIGTERM under_systemd=yes parent_name=systemd",
+    )
+    monkeypatch.setattr("gateway.shutdown_forensics.spawn_async_diagnostic", lambda *args, **kwargs: None)
+
+    from gateway.run import start_gateway
+
+    ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+
+    assert ok is True
+
+
+def test_non_systemd_sigterm_is_not_classified_as_managed_restart():
+    from gateway.run import _is_systemd_managed_sigterm
+
+    assert _is_systemd_managed_sigterm(
+        signal.SIGTERM,
+        {"signal": "SIGTERM", "under_systemd": False},
+    ) is False
+    assert _is_systemd_managed_sigterm(signal.SIGINT, {"under_systemd": True}) is False
+    assert _is_systemd_managed_sigterm(signal.SIGTERM, None) is False
 
 
 def test_runner_warns_when_docker_gateway_lacks_explicit_output_mount(monkeypatch, tmp_path, caplog):
