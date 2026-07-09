@@ -424,8 +424,9 @@ class TestGeneratedSystemdUnits:
         unit = gateway_cli.generate_systemd_unit(system=False)
 
         assert "ExecStart=" in unit
-        assert "ExecStop=-" in unit
-        assert "-m gateway.systemd_planned_stop $MAINPID" in unit
+        assert "ExecStop=-/bin/sh -c" in unit
+        assert '-m gateway.systemd_planned_stop "$MAINPID"' in unit
+        assert "-m gateway.systemd_planned_stop $MAINPID" not in unit
         assert " gateway stop" not in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
@@ -495,8 +496,9 @@ class TestGeneratedSystemdUnits:
         unit = gateway_cli.generate_systemd_unit(system=True)
 
         assert "ExecStart=" in unit
-        assert "ExecStop=-" in unit
-        assert "-m gateway.systemd_planned_stop $MAINPID" in unit
+        assert "ExecStop=-/bin/sh -c" in unit
+        assert '-m gateway.systemd_planned_stop "$MAINPID"' in unit
+        assert "-m gateway.systemd_planned_stop $MAINPID" not in unit
         assert " gateway stop" not in unit
         assert "ExecReload=/bin/kill -USR1 $MAINPID" in unit
         assert f"RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}" in unit
