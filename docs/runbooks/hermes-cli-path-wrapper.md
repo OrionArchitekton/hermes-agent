@@ -23,7 +23,11 @@ the active venv binary.
 scripts/install-cli-wrapper.sh \
   --force \
   --hermes-bin /home/hermes/hermes-agent-v31/venv/bin/hermes \
-  --link /home/hermes/.local/bin/hermes \
+  --link /home/hermes/.local/bin/hermes
+
+sudo scripts/install-cli-wrapper.sh \
+  --force \
+  --hermes-bin /home/hermes/hermes-agent-v31/venv/bin/hermes \
   --link /usr/local/bin/hermes
 ```
 
@@ -35,6 +39,14 @@ scripts/install-cli-wrapper.sh \
   --force \
   --hermes-bin /home/hermes/hermes-agent-v31/venv/bin/hermes \
   --link /home/hermes/.local/bin/hermes \
+  --slack-doppler-env-file /home/hermes/.hermes-runtimelab/doppler.env \
+  --doppler-bin /usr/bin/doppler \
+  --slack-doppler-project hermes-agent \
+  --slack-doppler-config prd
+
+sudo scripts/install-cli-wrapper.sh \
+  --force \
+  --hermes-bin /home/hermes/hermes-agent-v31/venv/bin/hermes \
   --link /usr/local/bin/hermes \
   --slack-doppler-env-file /home/hermes/.hermes-runtimelab/doppler.env \
   --doppler-bin /usr/bin/doppler \
@@ -44,6 +56,9 @@ scripts/install-cli-wrapper.sh \
 
 The installer refuses to overwrite non-managed launchers unless `--force` is
 present. Use `--force` only after verifying the existing file belongs to Hermes.
+Run the user-local install without `sudo`; otherwise
+`/home/hermes/.local/bin/hermes` can become root-owned and block later
+non-privileged updates.
 
 ## Validation
 
