@@ -3008,24 +3008,60 @@ def _systemd_quote_environment_assignment(assignment: str) -> str:
     return f'"{escaped}"'
 
 
+def _systemd_environment_assignments(line: str) -> list[str] | None:
+    stripped = line.lstrip()
+    if not stripped.startswith("Environment="):
+        return None
+
+    body = stripped[len("Environment=") :].strip()
+    if not body:
+        return []
+
+    try:
+        return shlex.split(body)
+    except ValueError:
+        return None
+
+
+def _systemd_hermes_home_from_service_stack(unit_path: Path) -> Path | None:
+    paths = [unit_path]
+    dropin_dir = _systemd_dropin_dir(unit_path)
+    if dropin_dir.is_dir():
+        paths.extend(sorted(dropin_dir.glob("*.conf")))
+
+    hermes_home: Path | None = None
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, PermissionError):
+            continue
+        for line in text.splitlines():
+            assignments = _systemd_environment_assignments(line)
+            if not assignments:
+                continue
+            for assignment in assignments:
+                if assignment.startswith("HERMES_HOME="):
+                    value = assignment.split("=", 1)[1].strip()
+                    if value:
+                        hermes_home = Path(value)
+    return hermes_home
+
+
 def _sanitize_gateway_path_environment_line(
     line: str,
     *,
     current_roots: set[Path],
     hermes_home: Path,
-) -> tuple[str, bool]:
+) -> tuple[str | None, bool]:
     stripped = line.lstrip()
     indent = line[: len(line) - len(stripped)]
     if not stripped.startswith("Environment="):
         return line, False
 
-    body = stripped[len("Environment=") :].strip()
-    if not body:
+    assignments = _systemd_environment_assignments(line)
+    if assignments is None:
         return line, False
-
-    try:
-        assignments = shlex.split(body)
-    except ValueError:
+    if not assignments:
         return line, False
 
     changed = False
@@ -3047,10 +3083,13 @@ def _sanitize_gateway_path_environment_line(
                 changed = True
                 continue
             filtered_entries.append(entry)
-        sanitized_assignments.append(f"PATH={':'.join(filtered_entries)}")
+        if filtered_entries:
+            sanitized_assignments.append(f"PATH={':'.join(filtered_entries)}")
 
     if not changed:
         return line, False
+    if not sanitized_assignments:
+        return None, True
 
     rendered = " ".join(
         _systemd_quote_environment_assignment(assignment)
@@ -3059,9 +3098,12 @@ def _sanitize_gateway_path_environment_line(
     return f"{indent}Environment={rendered}", True
 
 
-def _sanitize_gateway_path_environment_dropin(text: str) -> tuple[str, bool]:
+def _sanitize_gateway_path_environment_dropin(
+    text: str,
+    *,
+    hermes_home: Path,
+) -> tuple[str, bool]:
     current_roots = _current_gateway_project_roots()
-    hermes_home = get_hermes_home()
     changed = False
     sanitized_lines = []
     for line in text.splitlines():
@@ -3070,7 +3112,8 @@ def _sanitize_gateway_path_environment_dropin(text: str) -> tuple[str, bool]:
             current_roots=current_roots,
             hermes_home=hermes_home,
         )
-        sanitized_lines.append(sanitized_line)
+        if sanitized_line is not None:
+            sanitized_lines.append(sanitized_line)
         changed = changed or line_changed
     if not changed:
         return text, False
@@ -3125,13 +3168,17 @@ def _sanitize_stale_gateway_path_dropins(system: bool = False) -> list[Path]:
     if not dropin_dir.is_dir():
         return []
 
+    hermes_home = _systemd_hermes_home_from_service_stack(unit_path) or get_hermes_home()
     sanitized: list[Path] = []
     for dropin in sorted(dropin_dir.glob("*.conf")):
         try:
             original = dropin.read_text(encoding="utf-8", errors="ignore")
         except (OSError, PermissionError):
             continue
-        updated, changed = _sanitize_gateway_path_environment_dropin(original)
+        updated, changed = _sanitize_gateway_path_environment_dropin(
+            original,
+            hermes_home=hermes_home,
+        )
         if not changed:
             continue
         backup = _dropin_backup_path(dropin, "path-bak")

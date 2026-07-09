@@ -188,6 +188,102 @@ class TestSystemdServiceRefresh:
         assert f"{stale_node_bin}" in backups[0].read_text(encoding="utf-8")
         assert ["systemctl", "--user", "daemon-reload"] in calls
 
+    def test_refresh_removes_empty_stale_gateway_path_assignment(
+        self, tmp_path, monkeypatch
+    ):
+        current_root = tmp_path / "hermes-agent-v31"
+        retired_root = tmp_path / ".hermes" / "hermes-agent"
+        hermes_home = tmp_path / ".hermes"
+        current_root.mkdir()
+        retired_root.mkdir(parents=True)
+
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_text = "[Service]\nExecStart=/current/python -m hermes_cli.main gateway run\n"
+        unit_path.write_text(unit_text, encoding="utf-8")
+        dropin_dir = tmp_path / "hermes-gateway.service.d"
+        dropin_dir.mkdir()
+        path_dropin = dropin_dir / "80-path.conf"
+        stale_node_bin = retired_root / "node_modules" / ".bin"
+        path_dropin.write_text(
+            "[Service]\n"
+            f'Environment="PATH={stale_node_bin}"\n',
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", current_root)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_systemd_unit",
+            lambda system=False, run_as_user=None: unit_text,
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        assert gateway_cli.refresh_systemd_unit_if_needed(system=False) is True
+        sanitized = path_dropin.read_text(encoding="utf-8")
+        assert 'Environment="PATH=' not in sanitized
+        assert f"{stale_node_bin}" not in sanitized
+
+    def test_refresh_system_dropin_preserves_service_hermes_home_node_modules(
+        self, tmp_path, monkeypatch
+    ):
+        current_root = tmp_path / "hermes-agent-v31"
+        retired_root = tmp_path / "old" / "hermes-agent"
+        service_home = tmp_path / "home" / "alice" / ".hermes"
+        invoking_home = tmp_path / "root" / ".hermes"
+        current_root.mkdir()
+        retired_root.mkdir(parents=True)
+        service_node_bin = service_home / "node_modules" / ".bin"
+        service_node_bin.mkdir(parents=True)
+        invoking_home.mkdir(parents=True)
+
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_text = (
+            "[Service]\n"
+            "User=alice\n"
+            "ExecStart=/current/python -m hermes_cli.main gateway run\n"
+            f'Environment="HERMES_HOME={service_home}"\n'
+        )
+        unit_path.write_text(unit_text, encoding="utf-8")
+        dropin_dir = tmp_path / "hermes-gateway.service.d"
+        dropin_dir.mkdir()
+        path_dropin = dropin_dir / "95-upgrade-v31.conf"
+        stale_node_bin = retired_root / "node_modules" / ".bin"
+        path_dropin.write_text(
+            "[Service]\n"
+            f'Environment="PATH={service_node_bin}:{stale_node_bin}:/usr/bin"\n',
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", current_root)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: invoking_home)
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_systemd_unit",
+            lambda system=False, run_as_user=None: unit_text,
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        assert gateway_cli.refresh_systemd_unit_if_needed(system=True) is True
+        sanitized = path_dropin.read_text(encoding="utf-8")
+        assert f"{service_node_bin}" in sanitized
+        assert f"{stale_node_bin}" not in sanitized
+        assert "/usr/bin" in sanitized
+
     def test_refresh_keeps_current_dropin_when_project_root_is_site_packages(
         self, tmp_path, monkeypatch
     ):
