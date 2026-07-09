@@ -23,10 +23,15 @@ gateway child and writes the marker for the process that will run the signal
 handler. That stop is intentional and must drain cleanly instead of returning a
 process failure.
 
-The service refresh path also disables stale current-service `ExecStart`
-drop-ins whose Python virtualenv is rooted outside the current Hermes checkout.
-Those files are renamed to `.disabled-<timestamp>` before daemon reload, not
-deleted, so rollback remains a file rename.
+The service refresh path also reconciles current-service drop-ins:
+
+- stale `ExecStart` drop-ins whose Python virtualenv is rooted outside the
+  current Hermes checkout are renamed to `.disabled-<timestamp>`
+- stale `Environment=PATH` entries that point at a retired project
+  `node_modules/.bin` are removed in place after writing a
+  `.path-bak-<timestamp>` backup
+
+Both repairs run before daemon reload and preserve rollback files.
 
 ## Expected Behavior
 
@@ -60,7 +65,11 @@ restart window, and the installed unit contains
 `ExecStop=-/bin/sh -c 'exec ... -m gateway.systemd_planned_stop "$MAINPID"'`.
 The effective unit must not include an active `*.conf` drop-in whose
 `ExecStart` points at a retired checkout such as
-`/home/hermes/.hermes/hermes-agent/venv/bin/python`.
+`/home/hermes/.hermes/hermes-agent/venv/bin/python`, and neither
+`systemctl --user show hermes-gateway.service -p Environment` nor the live
+gateway process environment should include a retired project
+`node_modules/.bin` path such as
+`/home/hermes/.hermes/hermes-agent/node_modules/.bin`.
 
 ## Rollback
 
@@ -71,6 +80,10 @@ before relying on gateway failure counts.
 
 If rollback specifically needs a disabled drop-in, rename the matching
 `*.disabled-<timestamp>` file back to `.conf`, run
+`systemctl --user daemon-reload`, then restart the gateway.
+
+If rollback specifically needs a sanitized PATH drop-in, restore the matching
+`*.path-bak-<timestamp>` file over the active `.conf`, run
 `systemctl --user daemon-reload`, then restart the gateway.
 
 ## Durable Lesson
