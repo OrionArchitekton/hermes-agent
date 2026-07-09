@@ -14,11 +14,13 @@ references:
 
 Hermes gateway runs on hermes-01 as the user systemd service
 `hermes-gateway.service`. During `systemctl --user restart`, systemd sends
-SIGTERM to the process it owns. The generated unit runs
-`python -m gateway.systemd_planned_stop $MAINPID` in `ExecStop` before that
+SIGTERM to the process it owns. The generated unit runs a shell-wrapped
+`python -m gateway.systemd_planned_stop "$MAINPID"` in `ExecStop` before that
 signal, writing the same planned-stop marker used by `hermes gateway stop`.
-That stop is intentional and must drain cleanly instead of returning a process
-failure.
+If `MAINPID` is a wrapper such as `doppler`, the helper resolves the Python
+gateway child and writes the marker for the process that will run the signal
+handler. That stop is intentional and must drain cleanly instead of returning a
+process failure.
 
 ## Expected Behavior
 
@@ -49,7 +51,7 @@ systemctl --user status hermes-gateway.service --no-pager
 Expected result: the service restarts and remains active without a new
 `status=1/FAILURE` or `Failed with result 'exit-code'` line for the controlled
 restart window, and the installed unit contains
-`ExecStop=-... -m gateway.systemd_planned_stop $MAINPID`.
+`ExecStop=-/bin/sh -c 'exec ... -m gateway.systemd_planned_stop "$MAINPID"'`.
 
 ## Rollback
 

@@ -9,6 +9,7 @@ severity: medium
 applies_when:
   - hermes-gateway.service is managed by user systemd
   - generated systemd unit writes a planned-stop marker in ExecStop
+  - ExecStart may be wrapped by a process supervisor such as doppler
   - systemd sends SIGTERM after ExecStop during a controlled restart or stop
 symptoms:
   - "journalctl records Main process exited, code=exited, status=1/FAILURE"
@@ -46,12 +47,13 @@ an unexpected kill.
 
 ## Source Fix
 
-The generated systemd unit now runs
-`python -m gateway.systemd_planned_stop $MAINPID` in `ExecStop`. That helper
-writes the planned-stop marker for the service main PID before systemd sends
-SIGTERM, so the existing signal handler drains and exits cleanly. An unmarked
-SIGTERM, even when the gateway is launched by systemd, still stays on the
-existing nonzero crash-recovery path.
+The generated systemd unit now runs a shell-wrapped
+`python -m gateway.systemd_planned_stop "$MAINPID"` in `ExecStop`, so systemd's
+`MAINPID` value is expanded at stop time. The helper writes the planned-stop
+marker for that PID, or for the Python gateway child when `MAINPID` is a wrapper
+such as `doppler`. The existing signal handler then drains and exits cleanly.
+An unmarked SIGTERM, even when the gateway is launched by systemd, still stays
+on the existing nonzero crash-recovery path.
 
 ## Verification
 
