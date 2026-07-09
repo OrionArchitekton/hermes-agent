@@ -27,6 +27,7 @@ from pathlib import Path
 
 _DEFAULT_SLACK_REQUEST_URL = "https://hermes-agent.local/slack/commands"
 
+
 def _build_full_manifest(
     bot_name: str,
     bot_description: str,
@@ -106,12 +107,10 @@ def _build_full_manifest(
             "assistant_description": "Chat with Hermes in threads and DMs.",
         }
         bot_scopes.append("assistant:write")
-        bot_events.extend(
-            [
-                "assistant_thread_context_changed",
-                "assistant_thread_started",
-            ]
-        )
+        bot_events.extend([
+            "assistant_thread_context_changed",
+            "assistant_thread_started",
+        ])
         bot_scopes.sort()
         bot_events.sort()
 
