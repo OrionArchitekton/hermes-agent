@@ -2933,12 +2933,34 @@ def _gateway_execstart_python_roots(definition: str) -> list[Path]:
     return roots
 
 
+def _python_venv_project_root(python_path: str) -> Path | None:
+    candidate = Path(python_path)
+    if not candidate.is_absolute():
+        return None
+    bin_dir = candidate.parent
+    venv_dir = bin_dir.parent
+    if bin_dir.name != "bin" or venv_dir.name not in {"venv", ".venv"}:
+        return None
+    return _safe_resolve(venv_dir.parent)
+
+
+def _current_gateway_project_roots() -> set[Path]:
+    roots = {_safe_resolve(PROJECT_ROOT)}
+    try:
+        python_root = _python_venv_project_root(get_python_path())
+    except Exception:
+        python_root = None
+    if python_root is not None:
+        roots.add(python_root)
+    return roots
+
+
 def _stale_gateway_execstart_dropins(unit_path: Path) -> list[Path]:
     dropin_dir = _systemd_dropin_dir(unit_path)
     if not dropin_dir.is_dir():
         return []
 
-    current_root = _safe_resolve(PROJECT_ROOT)
+    current_roots = _current_gateway_project_roots()
     stale: list[Path] = []
     for dropin in sorted(dropin_dir.glob("*.conf")):
         try:
@@ -2948,7 +2970,7 @@ def _stale_gateway_execstart_dropins(unit_path: Path) -> list[Path]:
         roots = _gateway_execstart_python_roots(text)
         if not roots:
             continue
-        if any(root == current_root for root in roots):
+        if any(root in current_roots for root in roots):
             continue
         stale.append(dropin)
     return stale
