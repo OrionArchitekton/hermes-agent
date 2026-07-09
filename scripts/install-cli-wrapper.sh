@@ -100,6 +100,11 @@ write_wrapper() {
   link_dir="$(dirname "$link_path")"
   mkdir -p "$link_dir"
 
+  if [ -d "$link_path" ]; then
+    echo "install-cli-wrapper: target path is a directory: $link_path" >&2
+    return 1
+  fi
+
   if [ -e "$link_path" ] || [ -L "$link_path" ]; then
     if [ "$force" != true ] && ! is_managed_link "$link_path"; then
       echo "install-cli-wrapper: refusing to overwrite non-managed launcher: $link_path" >&2
@@ -130,21 +135,27 @@ if [[ ! -x "${REAL_HERMES}" ]]; then
 fi
 
 target=""
-if [[ "${1:-}" == "send" ]]; then
-  args=("$@")
-  for i in "${!args[@]}"; do
-    case "${args[$i]}" in
-      --to=*) target="${args[$i]#--to=}" ;;
-      -t=*) target="${args[$i]#-t=}" ;;
-      --to|-t)
-        next=$((i + 1))
-        if (( next < ${#args[@]} )); then
-          target="${args[$next]}"
-        fi
-        ;;
-    esac
-  done
-fi
+send_seen=false
+args=("$@")
+for i in "${!args[@]}"; do
+  if [[ "${send_seen}" != true ]]; then
+    if [[ "${args[$i]}" == "send" ]]; then
+      send_seen=true
+    fi
+    continue
+  fi
+
+  case "${args[$i]}" in
+    --to=*) target="${args[$i]#--to=}" ;;
+    -t=*) target="${args[$i]#-t=}" ;;
+    --to|-t)
+      next=$((i + 1))
+      if (( next < ${#args[@]} )); then
+        target="${args[$next]}"
+      fi
+      ;;
+  esac
+done
 
 if [[ -n "${SLACK_DOPPLER_ENV_FILE}" && ( "${target}" == "slack" || "${target}" == slack:* ) ]]; then
   if [[ ! -r "${SLACK_DOPPLER_ENV_FILE}" ]]; then

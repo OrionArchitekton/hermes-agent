@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
+
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="CLI wrapper is only supported on Unix-like systems",
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -63,6 +72,24 @@ def test_install_cli_wrapper_refuses_unrelated_existing_file(tmp_path: Path) -> 
     assert proc.returncode == 2
     assert "refusing to overwrite" in proc.stderr
     assert "unrelated operator file" in link.read_text(encoding="utf-8")
+
+
+def test_install_cli_wrapper_refuses_directory_target(tmp_path: Path) -> None:
+    real = tmp_path / "active" / "venv" / "bin" / "hermes"
+    link = tmp_path / "bin" / "hermes"
+    _write_executable(real, "#!/usr/bin/env bash\nexit 0\n")
+    link.mkdir(parents=True)
+
+    proc = subprocess.run(
+        [str(SCRIPT), "--force", "--hermes-bin", str(real), "--link", str(link)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 1
+    assert "target path is a directory" in proc.stderr
+    assert list(link.iterdir()) == []
 
 
 def test_install_cli_wrapper_force_replaces_existing_wrapper(tmp_path: Path) -> None:
@@ -139,5 +166,18 @@ def test_install_cli_wrapper_preserves_optional_slack_doppler_route(tmp_path: Pa
 
     assert run.returncode == 0
     assert "direct send --to slack:#ops hello" in run.stdout
+    doppler_args = record.read_text(encoding="utf-8")
+    assert "run --project hermes-agent --config prd --" in doppler_args
+
+    record.unlink()
+    run_with_profile = subprocess.run(
+        [str(link), "--profile", "prod", "send", "-t=slack:#ops", "hello"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert run_with_profile.returncode == 0
+    assert "direct --profile prod send -t=slack:#ops hello" in run_with_profile.stdout
     doppler_args = record.read_text(encoding="utf-8")
     assert "run --project hermes-agent --config prd --" in doppler_args
