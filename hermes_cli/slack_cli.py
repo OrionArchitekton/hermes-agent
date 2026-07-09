@@ -27,6 +27,7 @@ from pathlib import Path
 
 _DEFAULT_SLACK_REQUEST_URL = "https://hermes-agent.local/slack/commands"
 
+
 def _build_full_manifest(
     bot_name: str,
     bot_description: str,
