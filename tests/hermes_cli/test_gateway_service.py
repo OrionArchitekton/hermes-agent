@@ -129,6 +129,50 @@ class TestSystemdServiceRefresh:
         assert not list(dropin_dir.glob("*.disabled-*"))
         assert calls == []
 
+    def test_refresh_disables_stale_profile_gateway_execstart_dropin(
+        self, tmp_path, monkeypatch
+    ):
+        current_root = tmp_path / "hermes-agent-v31"
+        retired_root = tmp_path / ".hermes" / "hermes-agent"
+        current_root.mkdir()
+        retired_root.mkdir(parents=True)
+
+        unit_path = tmp_path / "hermes-gateway-coder.service"
+        unit_text = (
+            "[Service]\n"
+            "ExecStart=/current/python -m hermes_cli.main --profile coder gateway run\n"
+        )
+        unit_path.write_text(unit_text, encoding="utf-8")
+        dropin_dir = tmp_path / "hermes-gateway-coder.service.d"
+        dropin_dir.mkdir()
+        stale_dropin = dropin_dir / "90-doppler-wrap.conf"
+        stale_dropin.write_text(
+            "[Service]\n"
+            "ExecStart=\n"
+            f"ExecStart=/usr/bin/doppler run -- {retired_root}/venv/bin/python "
+            "-m hermes_cli.main --profile coder gateway run --replace\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", current_root)
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_systemd_unit",
+            lambda system=False, run_as_user=None: unit_text,
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        assert gateway_cli.refresh_systemd_unit_if_needed(system=False) is True
+        assert not stale_dropin.exists()
+        assert len(list(dropin_dir.glob("90-doppler-wrap.conf.disabled-*"))) == 1
+
     def test_systemd_install_repairs_outdated_unit_without_force(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "hermes-gateway.service"
         unit_path.write_text("old unit\n", encoding="utf-8")

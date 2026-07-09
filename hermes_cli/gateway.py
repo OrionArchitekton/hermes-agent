@@ -2886,19 +2886,39 @@ def _safe_resolve(path: Path) -> Path:
         return path
 
 
+def _tokens_contain_gateway_run(tokens: list[str]) -> bool:
+    try:
+        gateway_index = tokens.index("gateway")
+    except ValueError:
+        return False
+    return "run" in tokens[gateway_index + 1 :]
+
+
+def _execstart_tokens_launch_gateway(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if token == "-m" and index + 1 < len(tokens):
+            if tokens[index + 1] == "hermes_cli.main":
+                return _tokens_contain_gateway_run(tokens[index + 2 :])
+        if token.endswith("hermes_cli/main.py"):
+            return _tokens_contain_gateway_run(tokens[index + 1 :])
+        if Path(token).name == "hermes":
+            return _tokens_contain_gateway_run(tokens[index + 1 :])
+    return False
+
+
 def _gateway_execstart_python_roots(definition: str) -> list[Path]:
     roots: list[Path] = []
     for raw_line in definition.splitlines():
         line = raw_line.strip()
         if not line.startswith("ExecStart=") or line == "ExecStart=":
             continue
-        if not any(marker in line for marker in _LEGACY_UNIT_EXECSTART_MARKERS):
-            continue
         value = line.split("=", 1)[1]
         try:
             tokens = shlex.split(value)
         except ValueError:
             tokens = value.split()
+        if not _execstart_tokens_launch_gateway(tokens):
+            continue
         for token in tokens:
             candidate = Path(token)
             if not candidate.is_absolute():
