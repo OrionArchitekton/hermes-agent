@@ -8,13 +8,13 @@ component: gateway-runner
 severity: medium
 applies_when:
   - hermes-gateway.service is managed by user systemd
-  - systemd sends SIGTERM during a controlled restart or stop
-  - gateway shutdown context reports under_systemd=yes
+  - generated systemd unit writes a planned-stop marker in ExecStop
+  - systemd sends SIGTERM after ExecStop during a controlled restart or stop
 symptoms:
   - "journalctl records Main process exited, code=exited, status=1/FAILURE"
   - "journalctl records Failed with result 'exit-code' during controlled restart"
   - "the gateway immediately restarts and remains healthy"
-root_cause: systemd-sigterm-classified-as-unexpected-kill
+root_cause: systemd-stop-lacked-planned-stop-marker-before-sigterm
 resolution_type: source-fix
 related_components:
   - hermes-01
@@ -36,25 +36,31 @@ and stayed active.
 
 ## Root Cause
 
-`start_gateway()` treated any unmarked SIGTERM as an unexpected external kill.
-That was correct for bare process kills and container/runtime interruption, but
-wrong for the user systemd service path: systemd already owns the stop/restart
-decision and sends SIGTERM as part of normal service lifecycle.
+`start_gateway()` correctly treated unmarked SIGTERM as an unexpected external
+kill. That preserves crash recovery for bare `kill -TERM`, container/runtime
+interruption, and other unexpected process-manager signals. The missing piece
+was in the generated systemd unit: direct `systemctl --user restart
+hermes-gateway.service` did not write the existing planned-stop marker before
+systemd sent SIGTERM, so a controlled service-manager stop looked identical to
+an unexpected kill.
 
 ## Source Fix
 
-The signal handler now classifies SIGTERM with shutdown context
-`under_systemd=yes` as a managed service-manager stop. It drains and exits
-cleanly without setting the signal-initiated failure flag. Non-systemd SIGTERM
-still stays on the existing nonzero crash-recovery path.
+The generated systemd unit now runs
+`python -m gateway.systemd_planned_stop $MAINPID` in `ExecStop`. That helper
+writes the planned-stop marker for the service main PID before systemd sends
+SIGTERM, so the existing signal handler drains and exits cleanly. An unmarked
+SIGTERM, even when the gateway is launched by systemd, still stays on the
+existing nonzero crash-recovery path.
 
 ## Verification
 
 Source verification:
 
 ```bash
-uv run --extra dev pytest -q tests/gateway/test_runner_startup_failures.py::test_start_gateway_exits_cleanly_on_systemd_sigterm tests/gateway/test_runner_startup_failures.py::test_non_systemd_sigterm_is_not_classified_as_managed_restart
+uv run --extra dev pytest -q tests/gateway/test_runner_startup_failures.py::test_start_gateway_exits_cleanly_on_systemd_sigterm_with_planned_marker tests/gateway/test_runner_startup_failures.py::test_unmarked_systemd_sigterm_remains_signal_initiated_shutdown
 scripts/run_tests.sh tests/gateway/test_runner_startup_failures.py -q
+scripts/run_tests.sh tests/gateway/test_systemd_planned_stop.py tests/hermes_cli/test_gateway_service.py -q
 ```
 
 Live verification:
@@ -74,6 +80,6 @@ redeployed.
 
 ## Durable Lesson
 
-Do not infer failure solely from receipt of SIGTERM. The shutdown classifier
-must include supervisor context so controlled service-manager lifecycle events
-do not become false remediation signals.
+Do not infer intent from systemd ancestry. A supervised process can receive
+manual SIGTERM too, so controlled service-manager lifecycle must be marked
+explicitly before the runtime treats it as a clean stop.
