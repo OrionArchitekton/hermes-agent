@@ -52,6 +52,21 @@ from hermes_cli.colors import Colors, color
 
 logger = logging.getLogger(__name__)
 
+
+def _posix_getuid() -> int:
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        raise RuntimeError("POSIX uid lookup is not supported on this platform")
+    return int(getuid())
+
+
+def _posix_geteuid() -> int:
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        raise RuntimeError("POSIX effective uid lookup is not supported on this platform")
+    return int(geteuid())
+
+
 # =============================================================================
 # Process Management (for manual gateway runs)
 # =============================================================================
@@ -225,14 +240,13 @@ def _is_pid_ancestor_of_current_process(target_pid: int) -> bool:
 
 def _request_gateway_self_restart(pid: int) -> bool:
     """Ask a running gateway ancestor to restart itself asynchronously."""
-    if not hasattr(signal, "SIGUSR1"):
+    sigusr1 = getattr(signal, "SIGUSR1", None)
+    if sigusr1 is None:
         return False
     if not _is_pid_ancestor_of_current_process(pid):
         return False
     try:
-        os.kill(
-            pid, signal.SIGUSR1
-        )  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above
+        os.kill(pid, sigusr1)
     except (ProcessLookupError, PermissionError, OSError):
         return False
     return True
@@ -262,14 +276,13 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
         False if SIGUSR1 couldn't be sent or the process didn't exit in
         time (caller should fall back to a harder restart path).
     """
-    if not hasattr(signal, "SIGUSR1"):
+    sigusr1 = getattr(signal, "SIGUSR1", None)
+    if sigusr1 is None:
         return False
     if pid <= 0:
         return False
     try:
-        os.kill(
-            pid, signal.SIGUSR1
-        )  # windows-footgun: ok — POSIX signal, guarded by hasattr(signal, 'SIGUSR1') above
+        os.kill(pid, sigusr1)
     except ProcessLookupError:
         # Already gone — nothing to drain.
         return True
@@ -1814,17 +1827,13 @@ class SystemScopeRequiresRootError(RuntimeError):
 
 def _user_dbus_socket_path() -> Path:
     """Return the expected per-user D-Bus socket path (regardless of existence)."""
-    xdg = (
-        os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    )  # windows-footgun: ok — POSIX systemd helper, never invoked on Windows
+    xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{_posix_getuid()}"
     return Path(xdg) / "bus"
 
 
 def _user_systemd_private_socket_path() -> Path:
     """Return the per-user systemd private socket path (regardless of existence)."""
-    xdg = (
-        os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    )  # windows-footgun: ok — POSIX systemd helper, never invoked on Windows
+    xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{_posix_getuid()}"
     return Path(xdg) / "systemd" / "private"
 
 
@@ -1850,9 +1859,7 @@ def _ensure_user_systemd_env() -> None:
     We detect the standard socket path and set the vars so all subsequent
     subprocess calls inherit them.
     """
-    uid = (
-        os.getuid()
-    )  # windows-footgun: ok — POSIX systemd helper, never invoked on Windows
+    uid = _posix_getuid()
     if "XDG_RUNTIME_DIR" not in os.environ:
         runtime_dir = f"/run/user/{uid}"
         if Path(runtime_dir).exists():
@@ -1918,7 +1925,7 @@ def _preflight_user_systemd(*, auto_enable_linger: bool = True) -> None:
             username,
             reason="User systemd control sockets are missing even though linger is enabled.",
             fix_hint=(
-                f"  systemctl start user@{os.getuid()}.service\n"  # windows-footgun: ok — POSIX systemd helper, never invoked on Windows
+                f"  systemctl start user@{_posix_getuid()}.service\n"
                 "  (may require sudo; try again after the command succeeds)"
             ),
         )
@@ -2192,9 +2199,7 @@ def remove_legacy_hermes_units(
 
     # System-scope removal (needs root)
     if system_units:
-        if (
-            os.geteuid() != 0
-        ):  # windows-footgun: ok — Linux systemd removal path, guarded by `if system == "Linux"` / systemd-only branch
+        if _posix_geteuid() != 0:
             print()
             print_warning("System-scope legacy units require root to remove.")
             print_info("  Re-run with: sudo hermes gateway migrate-legacy")
@@ -2249,9 +2254,7 @@ def print_systemd_scope_conflict_warning() -> None:
 
 
 def _require_root_for_system_service(action: str) -> None:
-    if (
-        os.geteuid() != 0
-    ):  # windows-footgun: ok — POSIX systemd helper, never invoked on Windows
+    if _posix_geteuid() != 0:
         raise SystemScopeRequiresRootError(
             f"System gateway {action} requires root. Re-run with sudo.",
             action,
@@ -2317,9 +2320,7 @@ def prompt_linux_gateway_install_scope() -> str | None:
     # root — a non-root user is never handed a "re-run yourself under sudo"
     # recipe, since that just funnels them into a system install they can't
     # actually perform from here. Non-root sessions get the user service.
-    is_root = (
-        os.geteuid() == 0
-    )  # windows-footgun: ok — Linux systemd install wizard, never invoked on Windows
+    is_root = _posix_geteuid() == 0
     if not is_root:
         choice = prompt_choice(
             "  Choose how the gateway should run in the background:",
@@ -2357,9 +2358,7 @@ def install_linux_gateway_from_setup(
 
     if scope == "system":
         run_as_user = _default_system_service_user()
-        if (
-            os.geteuid() != 0
-        ):  # windows-footgun: ok — Linux systemd install wizard, never invoked on Windows
+        if _posix_geteuid() != 0:
             # Unreachable from the wizard: prompt_linux_gateway_install_scope()
             # only offers "system" to root sessions. Defensive guard for any
             # direct caller — we do NOT print a self-elevation recipe.
@@ -2412,9 +2411,7 @@ def get_systemd_linger_status() -> tuple[bool | None, str]:
         try:
             import pwd
 
-            username = (
-                pwd.getpwuid(os.getuid()).pw_name
-            )  # windows-footgun: ok — POSIX loginctl helper, never invoked on Windows
+            username = pwd.getpwuid(_posix_getuid()).pw_name
         except Exception:
             return None, "could not determine current user"
 
@@ -2465,9 +2462,7 @@ def _launchd_user_home() -> Path:
     """
     import pwd
 
-    return Path(
-        pwd.getpwuid(os.getuid()).pw_dir
-    )  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    return Path(pwd.getpwuid(_posix_getuid()).pw_dir)
 
 
 def get_launchd_plist_path() -> Path:
@@ -3061,9 +3056,7 @@ def _system_scope_wizard_would_need_root(system: bool = False) -> bool:
     ``SystemScopeRequiresRootError`` propagate out and leave the user
     staring at a bare shell.
     """
-    if (
-        os.geteuid() == 0
-    ):  # windows-footgun: ok — systemd scope wizard decision, never invoked on Windows
+    if _posix_geteuid() == 0:
         return False
     return _select_systemd_scope(system=system)
 
@@ -3519,9 +3512,7 @@ def _launchd_domain() -> str:
     if _resolved_launchd_domain is not None:
         return _resolved_launchd_domain
 
-    uid = (
-        os.getuid()
-    )  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    uid = _posix_getuid()
     label = get_launchd_label()
     gui_domain = f"gui/{uid}"
     user_domain = f"user/{uid}"
