@@ -482,6 +482,23 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # 2026-07-17 incident guards: a hung close_async held the reconnect
+        # lock and parked the watchdog while slack_sdk retried a closed
+        # aiohttp session forever. Teardown is bounded, and if the socket
+        # stays unhealthy past _socket_exit_after_s despite reconnects we
+        # hard-exit 75 so systemd (Restart=always + RestartForceExitStatus=75)
+        # recovers the process — the loop is terminal in-process by
+        # construction (slack_sdk never rebuilds a closed ClientSession).
+        self._socket_close_timeout_s = 10.0
+        self._socket_exit_after_s = 180.0
+        self._socket_unhealthy_since: Optional[float] = None
+        # Escalation is gated on TERMINAL evidence (closed aiohttp session or
+        # a wedged teardown) — states in-process reconnects cannot clear if
+        # they persist. Plain unreachability (a Slack/network outage) never
+        # exits: the process serves other platforms, and foreground runs
+        # have no supervisor to restart it (PR #19 review).
+        self._socket_terminal_evidence = False
+        self._fatal_exit = lambda: os._exit(75)
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -504,32 +521,69 @@ class SlackAdapter(BasePlatformAdapter):
         self._handler = None
         self._socket_mode_task = None
 
+        # Bounded teardown via asyncio.wait (NOT wait_for: its timeout path
+        # cancels and then AWAITS the task, so a cancel-swallowing task
+        # would hang the teardown - and the reconnect lock - forever).
         if handler is not None:
-            try:
-                await handler.close_async()
-            except Exception as e:  # pragma: no cover - defensive logging
+            close_task = asyncio.ensure_future(handler.close_async())
+            done, _pending = await asyncio.wait(
+                {close_task}, timeout=self._socket_close_timeout_s
+            )
+            if not done:
+                self._socket_terminal_evidence = True
+                close_task.cancel()
                 logger.warning(
-                    "[Slack] Error while closing Socket Mode handler: %s",
-                    e,
-                    exc_info=True,
+                    "[Slack] Socket Mode handler close timed out after %.0fs; "
+                    "abandoning it",
+                    self._socket_close_timeout_s,
                 )
+            else:
+                try:
+                    close_task.result()
+                except Exception as e:  # pragma: no cover - defensive logging
+                    logger.warning(
+                        "[Slack] Error while closing Socket Mode handler: %s",
+                        e,
+                        exc_info=True,
+                    )
 
         if task is not None and not task.done():
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:  # pragma: no cover - defensive logging
-                logger.debug(
-                    "[Slack] Socket Mode task failed while stopping", exc_info=True
+            done, _pending = await asyncio.wait(
+                {task}, timeout=self._socket_close_timeout_s
+            )
+            if not done:
+                self._socket_terminal_evidence = True
+                logger.warning(
+                    "[Slack] Socket Mode task did not settle within %.0fs of "
+                    "cancellation; abandoning it",
+                    self._socket_close_timeout_s,
                 )
+            else:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # pragma: no cover - defensive logging
+                    logger.debug(
+                        "[Slack] Socket Mode task failed while stopping",
+                        exc_info=True,
+                    )
 
     async def _socket_transport_connected(self) -> Optional[bool]:
         """Best-effort check of current Socket Mode transport state."""
         client = getattr(self._handler, "client", None)
         if client is None:
             return None
+
+        # A closed aiohttp session is definitively dead: slack_sdk's connect
+        # retry loop never recreates it, so is_connected/probe errors must not
+        # mask this state. Strict `is True` — test doubles auto-create truthy
+        # Mock attributes.
+        session = getattr(client, "aiohttp_client_session", None)
+        if session is not None and getattr(session, "closed", None) is True:
+            self._socket_terminal_evidence = True
+            return False
 
         state = getattr(client, "is_connected", None)
         if state is None:
@@ -579,17 +633,65 @@ class SlackAdapter(BasePlatformAdapter):
                     break
 
                 task = self._socket_mode_task
+                unhealthy_reason: Optional[str] = None
                 if task is None:
-                    await self._restart_socket_mode("socket task missing")
+                    unhealthy_reason = "socket task missing"
+                elif task.done():
+                    unhealthy_reason = "socket task stopped"
+                else:
+                    connected = await self._socket_transport_connected()
+                    if connected is False:
+                        unhealthy_reason = "transport disconnected"
+
+                if unhealthy_reason is None:
+                    self._socket_unhealthy_since = None
+                    self._socket_terminal_evidence = False
                     continue
 
-                if task.done():
-                    await self._restart_socket_mode("socket task stopped")
-                    continue
+                now = time.monotonic()
+                if self._socket_unhealthy_since is None:
+                    self._socket_unhealthy_since = now
+                elif (
+                    self._socket_terminal_evidence
+                    and now - self._socket_unhealthy_since
+                    >= self._socket_exit_after_s
+                ):
+                    if os.environ.get("INVOCATION_ID"):
+                        # systemd run: Restart=always +
+                        # RestartForceExitStatus=75 guarantee recovery.
+                        logger.critical(
+                            "[Slack] Socket Mode terminally unhealthy for "
+                            "%.0fs despite reconnect attempts (%s); exiting "
+                            "75 so systemd restarts the gateway",
+                            now - self._socket_unhealthy_since,
+                            unhealthy_reason,
+                        )
+                        self._fatal_exit()
+                        return
+                    # No supervisor (foreground/container run): killing the
+                    # process would take healthy platforms down with nothing
+                    # to restart it. Leave the Slack adapter stopped and
+                    # loud; the DD gateway-error monitor pages on this line.
+                    logger.critical(
+                        "[Slack] Socket Mode terminally unhealthy for %.0fs "
+                        "(%s) and no supervisor detected (INVOCATION_ID "
+                        "unset); leaving the Slack adapter stopped instead "
+                        "of killing the process",
+                        now - self._socket_unhealthy_since,
+                        unhealthy_reason,
+                    )
+                    # Detach before returning: the done-callback respawns
+                    # the watchdog for any task it still owns, which would
+                    # re-log this CRITICAL every interval forever.
+                    self._socket_watchdog_task = None
+                    return
 
-                connected = await self._socket_transport_connected()
-                if connected is False:
-                    await self._restart_socket_mode("transport disconnected")
+                # A restart already in flight (done-callback path) holds the
+                # lock; queuing another would stack duplicate handlers. The
+                # escalation clock above still runs, so a wedged restart
+                # cannot park recovery.
+                if not self._socket_reconnect_lock.locked():
+                    await self._restart_socket_mode(unhealthy_reason)
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging

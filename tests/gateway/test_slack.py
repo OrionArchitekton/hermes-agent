@@ -511,6 +511,240 @@ class TestSlackSocketWatchdog:
             assert len(instances) == 1, "watchdog kept reconnecting after disconnect"
 
     @pytest.mark.asyncio
+    async def test_restart_survives_hung_close_async(self):
+        """A hung handler.close_async() must not park the watchdog forever.
+
+        2026-07-17 incident: close_async hung while holding
+        _socket_reconnect_lock, so the watchdog never reconnected and
+        slack_sdk retried a closed session every 10s until manual restart.
+        """
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.01
+        adapter._socket_close_timeout_s = 0.05
+        Base, instances = self._make_fake_handler_factory()
+
+        class HangingCloseHandler(Base):
+            async def close_async(self):
+                self.closed = True
+                await asyncio.Event().wait()  # never returns
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(HangingCloseHandler):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                assert len(instances) == 1
+
+                instances[0].client.is_connected = lambda: False
+
+                for _ in range(60):
+                    if len(instances) >= 2:
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert len(instances) >= 2, (
+                    "watchdog wedged on hung close_async instead of timing out"
+                )
+                assert adapter._handler is instances[-1]
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_closed_session_reads_as_disconnected(self):
+        """A closed aiohttp session is definitively unhealthy, even when the
+        is_connected probe raises (today's probe returns None = treated
+        healthy, leaving a zombie retry loop in place)."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.01
+        factory, instances = self._make_fake_handler_factory()
+
+        def _probe_raises():
+            raise RuntimeError("probe failed")
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                assert len(instances) == 1
+
+                instances[0].client.is_connected = _probe_raises
+                instances[0].client.aiohttp_client_session.closed = True
+
+                for _ in range(40):
+                    if len(instances) >= 2:
+                        break
+                    await asyncio.sleep(0.01)
+
+                assert len(instances) >= 2, (
+                    "closed aiohttp session was not treated as disconnected"
+                )
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_plain_disconnect_never_fatal_exits(self):
+        """A persistent but non-terminal disconnect (e.g. a Slack outage) must
+        keep reconnecting forever, never exit: the process serves other
+        platforms, and foreground (non-systemd) runs have no supervisor to
+        restart it (review finding, PR #19)."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.01
+        adapter._socket_exit_after_s = 0.05
+        fatal = MagicMock()
+        adapter._fatal_exit = fatal
+        Base, instances = self._make_fake_handler_factory()
+
+        class AlwaysDisconnected(Base):
+            def __init__(self, app, app_token, proxy=None):
+                super().__init__(app, app_token, proxy=proxy)
+                self.client.is_connected = lambda: False
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(AlwaysDisconnected):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+
+                for _ in range(30):
+                    await asyncio.sleep(0.01)
+
+                assert not fatal.called, (
+                    "plain persistent disconnect must not kill the gateway"
+                )
+                assert len(instances) >= 2, (
+                    "reconnect attempts must continue during the outage"
+                )
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_terminal_closed_session_escalates_to_fatal_exit(self):
+        """A closed aiohttp session that persists across reconnects is
+        terminal in-process (slack_sdk never rebuilds it); after the window
+        the adapter must escalate to the injectable fatal-exit hook (prod:
+        os._exit(75) so systemd's Restart=always + RestartForceExitStatus=75
+        recovers the process)."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.01
+        adapter._socket_exit_after_s = 0.05
+        fatal = MagicMock()
+        adapter._fatal_exit = fatal
+        Base, instances = self._make_fake_handler_factory()
+
+        class TerminalSession(Base):
+            def __init__(self, app, app_token, proxy=None):
+                super().__init__(app, app_token, proxy=proxy)
+                self.client.aiohttp_client_session.closed = True
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(TerminalSession):
+                stack.enter_context(p)
+            stack.enter_context(
+                patch.dict(os.environ, {"INVOCATION_ID": "test-systemd-run"})
+            )
+
+            try:
+                assert await adapter.connect() is True
+
+                for _ in range(80):
+                    if fatal.called:
+                        break
+                    await asyncio.sleep(0.01)
+
+                assert fatal.called, (
+                    "terminally closed session never escalated to fatal exit"
+                )
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_terminal_without_supervisor_stops_slack_not_process(self):
+        """Without systemd (INVOCATION_ID unset), a terminal state must NOT
+        kill the process (other platforms stay up, and a foreground run has
+        nothing to restart it): the Slack watchdog stops, loudly."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.01
+        adapter._socket_exit_after_s = 0.05
+        fatal = MagicMock()
+        adapter._fatal_exit = fatal
+        Base, instances = self._make_fake_handler_factory()
+
+        class TerminalSession(Base):
+            def __init__(self, app, app_token, proxy=None):
+                super().__init__(app, app_token, proxy=proxy)
+                self.client.aiohttp_client_session.closed = True
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(TerminalSession):
+                stack.enter_context(p)
+            # Build AFTER the stack so SLACK_APP_TOKEN survives the clear.
+            env = {k: v for k, v in os.environ.items() if k != "INVOCATION_ID"}
+            stack.enter_context(patch.dict(os.environ, env, clear=True))
+
+            try:
+                assert await adapter.connect() is True
+
+                for _ in range(40):
+                    await asyncio.sleep(0.01)
+
+                assert not fatal.called, (
+                    "unsupervised run must not be killed by the Slack adapter"
+                )
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_restart_survives_cancel_unresponsive_task(self):
+        """A socket task that swallows cancellation must not park the restart
+        (and with it the watchdog) inside the reconnect lock forever: the
+        post-cancel await is bounded and the task is abandoned (review
+        finding, PR #19)."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.01
+        adapter._socket_close_timeout_s = 0.05
+        Base, instances = self._make_fake_handler_factory()
+
+        class CancelUnresponsive(Base):
+            _allow_death = False  # flipped in teardown so the loop can close
+
+            async def start_async(self):
+                self.start_calls += 1
+                while True:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        if self._allow_death:
+                            raise
+                        continue  # refuses to die
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(CancelUnresponsive):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                assert len(instances) == 1
+
+                instances[0].client.is_connected = lambda: False
+
+                for _ in range(60):
+                    if len(instances) >= 2:
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert len(instances) >= 2, (
+                    "watchdog parked on a cancel-unresponsive socket task"
+                )
+            finally:
+                for h in instances:
+                    h._allow_death = True
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
     async def test_watchdog_cancellation_does_not_respawn(self):
         """Cancellation is the intentional-shutdown signal — no respawn allowed."""
         adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
