@@ -643,6 +643,9 @@ class TestSlackSocketWatchdog:
         with contextlib.ExitStack() as stack:
             for p in self._patch_stack(TerminalSession):
                 stack.enter_context(p)
+            stack.enter_context(
+                patch.dict(os.environ, {"INVOCATION_ID": "test-systemd-run"})
+            )
 
             try:
                 assert await adapter.connect() is True
@@ -654,6 +657,42 @@ class TestSlackSocketWatchdog:
 
                 assert fatal.called, (
                     "terminally closed session never escalated to fatal exit"
+                )
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_terminal_without_supervisor_stops_slack_not_process(self):
+        """Without systemd (INVOCATION_ID unset), a terminal state must NOT
+        kill the process (other platforms stay up, and a foreground run has
+        nothing to restart it): the Slack watchdog stops, loudly."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.01
+        adapter._socket_exit_after_s = 0.05
+        fatal = MagicMock()
+        adapter._fatal_exit = fatal
+        Base, instances = self._make_fake_handler_factory()
+
+        class TerminalSession(Base):
+            def __init__(self, app, app_token, proxy=None):
+                super().__init__(app, app_token, proxy=proxy)
+                self.client.aiohttp_client_session.closed = True
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(TerminalSession):
+                stack.enter_context(p)
+            # Build AFTER the stack so SLACK_APP_TOKEN survives the clear.
+            env = {k: v for k, v in os.environ.items() if k != "INVOCATION_ID"}
+            stack.enter_context(patch.dict(os.environ, env, clear=True))
+
+            try:
+                assert await adapter.connect() is True
+
+                for _ in range(40):
+                    await asyncio.sleep(0.01)
+
+                assert not fatal.called, (
+                    "unsupervised run must not be killed by the Slack adapter"
                 )
             finally:
                 await adapter.disconnect()

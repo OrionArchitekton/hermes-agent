@@ -656,14 +656,34 @@ class SlackAdapter(BasePlatformAdapter):
                     and now - self._socket_unhealthy_since
                     >= self._socket_exit_after_s
                 ):
+                    if os.environ.get("INVOCATION_ID"):
+                        # systemd run: Restart=always +
+                        # RestartForceExitStatus=75 guarantee recovery.
+                        logger.critical(
+                            "[Slack] Socket Mode terminally unhealthy for "
+                            "%.0fs despite reconnect attempts (%s); exiting "
+                            "75 so systemd restarts the gateway",
+                            now - self._socket_unhealthy_since,
+                            unhealthy_reason,
+                        )
+                        self._fatal_exit()
+                        return
+                    # No supervisor (foreground/container run): killing the
+                    # process would take healthy platforms down with nothing
+                    # to restart it. Leave the Slack adapter stopped and
+                    # loud; the DD gateway-error monitor pages on this line.
                     logger.critical(
                         "[Slack] Socket Mode terminally unhealthy for %.0fs "
-                        "despite reconnect attempts (%s); exiting 75 so "
-                        "systemd restarts the gateway",
+                        "(%s) and no supervisor detected (INVOCATION_ID "
+                        "unset); leaving the Slack adapter stopped instead "
+                        "of killing the process",
                         now - self._socket_unhealthy_since,
                         unhealthy_reason,
                     )
-                    self._fatal_exit()
+                    # Detach before returning: the done-callback respawns
+                    # the watchdog for any task it still owns, which would
+                    # re-log this CRITICAL every interval forever.
+                    self._socket_watchdog_task = None
                     return
 
                 # A restart already in flight (done-callback path) holds the
