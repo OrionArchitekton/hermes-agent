@@ -182,7 +182,9 @@ fi
 # verification command for a version cutover, so it must not depend on Doppler being
 # reachable. Anything unlisted is wrapped: it then gets credentials it may not need
 # (harmless) instead of missing ones it does (the 401 above).
-if [[ -n "${SLACK_DOPPLER_ENV_FILE}" && "$#" -gt 0 ]]; then
+# NOTE: no argument-count condition here. Bare `hermes` (zero args) opens the
+# interactive agent, which is the invocation that needs credentials MOST.
+if [[ -n "${SLACK_DOPPLER_ENV_FILE}" ]]; then
   doppler_local_only=false
   for arg in "$@"; do
     case "${arg}" in

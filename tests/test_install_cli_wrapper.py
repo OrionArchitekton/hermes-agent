@@ -244,3 +244,21 @@ def test_install_cli_wrapper_leaves_version_and_help_unwrapped(tmp_path: Path) -
         assert run.returncode == 0, run.stderr
         assert "direct " + " ".join(argv) in run.stdout
         assert not record.exists(), f"{argv} must not be Doppler-wrapped"
+
+
+def test_install_cli_wrapper_wraps_bare_invocation(tmp_path: Path) -> None:
+    """Bare `hermes` launches the interactive agent and MUST receive credentials.
+
+    Regression: the first version of this guard required `"$#" -gt 0`, so the single most
+    common invocation (bare `hermes`, which opens the TUI) silently bypassed Doppler.
+    The config's `api_key: ${MANIFEST_API_KEY}` then resolved to nothing and the router
+    rejected it as a malformed key, which surfaced as an auth error rather than as a
+    missing-credential error.
+    """
+    link, record = _install_with_doppler(tmp_path)
+
+    run = subprocess.run([str(link)], capture_output=True, text=True, check=False)
+
+    assert run.returncode == 0, run.stderr
+    assert record.exists(), "bare `hermes` must be Doppler-wrapped"
+    assert "run --project hermes-agent --config prd --" in record.read_text(encoding="utf-8")
