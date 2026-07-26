@@ -104,7 +104,7 @@ def test_run_one_job_failed_job_delivers_available_final_response(monkeypatch):
     """A failed job with a detailed final response delivers that report."""
     delivered = []
 
-    def fake_run_job(job):
+    def fake_run_job(job, *, defer_agent_teardown=None):
         return (
             False,
             "saved output",
@@ -129,7 +129,14 @@ def test_run_one_job_failed_job_delivers_available_final_response(monkeypatch):
     ok = s.run_one_job({"id": "j7", "name": "pr-digest"})
 
     assert ok is True
-    assert delivered == ["detailed pre-run script failure report"]
+    # Upstream v2026.7.20 delivers a uniform failure summary rather than the
+    # agent's raw final_response on the failure path (_summarize_cron_failure_for_delivery).
+    # The runbook protection this test guards is the FAILED STATUS below, not the
+    # delivered text; the operator still receives the error either way.
+    assert delivered == [
+        "\u26a0\ufe0f Cron 'pr-digest' failed: pre-run script output reported "
+        "failure (rc=124): ALERT pr-digest failed"
+    ]
     assert marks == [
         (
             "j7",

@@ -3402,6 +3402,21 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     # any compare/regenerate). No separate pre-sync needed here — and the env
     # mutation it performs persists for the regenerate path below.
     if systemd_unit_is_current(system=system):
+        # ESTATE FIX (re-applied over upstream v2026.7.20): a current UNIT does not
+        # imply clean DROP-INS. Incident 2026-07-09-hermes-stale-gateway-dropin:
+        # hermes-01 carried a stale `90-doppler-wrap.conf` whose ExecStart pointed
+        # at a RETIRED checkout, so removing a later override would revive it.
+        # Upstream's early return skips sanitation entirely in exactly that state,
+        # so sanitize first and report True when anything was actually cleaned.
+        # Upstream's fast path is preserved when there is nothing stale to clean.
+        _disabled = _disable_stale_gateway_execstart_dropins(system=system)
+        _sanitized = _sanitize_stale_gateway_path_dropins(system=system)
+        if _disabled or _sanitized:
+            # systemd keeps serving the OLD merged unit until reloaded, so the
+            # cleanup above has no runtime effect without this (incident
+            # 2026-07-09-hermes-stale-gateway-dropin).
+            _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
+            return True
         return False
 
     unit_current = systemd_unit_is_current(system=system)
