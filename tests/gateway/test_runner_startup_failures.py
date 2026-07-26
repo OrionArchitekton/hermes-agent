@@ -577,10 +577,14 @@ async def _run_start_gateway_until_sigterm(monkeypatch, tmp_path, *, planned_sto
             self._restart_requested = False
             self._restart_via_service = False
             self._signal_initiated_shutdown = False
+            # Upstream f4a54b629 gates startup on `runner._running`; mirror the real
+            # GatewayRunner lifecycle (False until running mode) so the guard stays exercised.
+            self._running = False
             self._stopped = asyncio.Event()
             runner_ref["runner"] = self
 
         async def start(self):
+            self._running = True
             cb, args = handlers[signal.SIGTERM]
             asyncio.get_running_loop().call_soon(cb, *args)
             return True

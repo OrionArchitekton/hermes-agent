@@ -173,6 +173,37 @@ if [[ -n "${SLACK_DOPPLER_ENV_FILE}" && ( "${target}" == "slack" || "${target}" 
   exec "${DOPPLER_BIN}" run --project "${SLACK_DOPPLER_PROJECT}" --config "${SLACK_DOPPLER_CONFIG}" -- "${REAL_HERMES}" "$@"
 fi
 
+# Non-Slack commands need the same Doppler-injected secrets (notably the LLM router
+# credential). Without this, an interactive agent turn reaches the router with no
+# credential and fails auth, while cron works because systemd supplies the token via
+# EnvironmentFile -- the exact split that produced the router 401.
+#
+# Local-only commands are deliberately EXCLUDED: `hermes --version` is the operator
+# verification command for a version cutover, so it must not depend on Doppler being
+# reachable. Anything unlisted is wrapped: it then gets credentials it may not need
+# (harmless) instead of missing ones it does (the 401 above).
+if [[ -n "${SLACK_DOPPLER_ENV_FILE}" && "$#" -gt 0 ]]; then
+  doppler_local_only=false
+  for arg in "$@"; do
+    case "${arg}" in
+      --version|-V|--help|-h) doppler_local_only=true; break ;;
+    esac
+  done
+
+  if [[ "${doppler_local_only}" != true ]]; then
+    if [[ -r "${SLACK_DOPPLER_ENV_FILE}" && -x "${DOPPLER_BIN}" ]]; then
+      set -a
+      # shellcheck source=/dev/null
+      . "${SLACK_DOPPLER_ENV_FILE}"
+      set +a
+      exec "${DOPPLER_BIN}" run --project "${SLACK_DOPPLER_PROJECT}" --config "${SLACK_DOPPLER_CONFIG}" -- "${REAL_HERMES}" "$@"
+    fi
+    # Fail SOFT but LOUD: a missing env file or doppler binary must not brick the whole
+    # CLI, but it must not silently degrade into an auth error either.
+    echo "hermes wrapper: WARNING running without Doppler secrets (env file or doppler binary unavailable); credentialed commands may fail auth" >&2
+  fi
+fi
+
 exec "${REAL_HERMES}" "$@"
 WRAPPER
   } > "$tmp"

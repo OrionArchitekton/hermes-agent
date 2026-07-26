@@ -181,3 +181,66 @@ def test_install_cli_wrapper_preserves_optional_slack_doppler_route(tmp_path: Pa
     assert "direct --profile prod send -t=slack:#ops hello" in run_with_profile.stdout
     doppler_args = record.read_text(encoding="utf-8")
     assert "run --project hermes-agent --config prd --" in doppler_args
+
+
+def _install_with_doppler(tmp_path: Path):
+    """Install a wrapper wired to a fake doppler that records its argv."""
+    real = tmp_path / "active" / "venv" / "bin" / "hermes"
+    doppler = tmp_path / "bin" / "doppler"
+    env_file = tmp_path / "doppler.env"
+    link = tmp_path / "bin" / "hermes"
+    record = tmp_path / "doppler_args.txt"
+    _write_executable(real, "#!/usr/bin/env bash\nprintf 'direct %s\\n' \"$*\"\n")
+    _write_executable(
+        doppler,
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" > {record}\n"
+        "while [ \"$#\" -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\n"
+        "[ \"$#\" -gt 0 ] && shift\n"
+        "exec \"$@\"\n",
+    )
+    env_file.write_text("DOPPLER_TOKEN=fake-not-a-real-token\n", encoding="utf-8")
+    proc = subprocess.run(
+        [
+            str(SCRIPT), "--hermes-bin", str(real), "--link", str(link),
+            "--slack-doppler-env-file", str(env_file), "--doppler-bin", str(doppler),
+            "--slack-doppler-project", "hermes-agent", "--slack-doppler-config", "prd",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return link, record
+
+
+def test_install_cli_wrapper_wraps_general_commands_in_doppler(tmp_path: Path) -> None:
+    """A non-Slack command must still get Doppler-injected secrets.
+
+    Regression: the wrapper only sourced the env file for `send --to slack`, so an
+    interactive agent turn reached the LLM router with no credential and got a 401,
+    while cron (systemd EnvironmentFile) worked.
+    """
+    link, record = _install_with_doppler(tmp_path)
+
+    run = subprocess.run([str(link), "chat", "hello"], capture_output=True, text=True, check=False)
+
+    assert run.returncode == 0, run.stderr
+    assert record.exists(), "general commands must be Doppler-wrapped"
+    assert "run --project hermes-agent --config prd --" in record.read_text(encoding="utf-8")
+
+
+def test_install_cli_wrapper_leaves_version_and_help_unwrapped(tmp_path: Path) -> None:
+    """`--version`/`--help` must never depend on Doppler.
+
+    `hermes --version` is the operator verification command for a version cutover; if it
+    routed through `doppler run`, a Doppler outage or token scope error would read as a
+    failed upgrade.
+    """
+    link, record = _install_with_doppler(tmp_path)
+
+    for argv in (["--version"], ["--help"], ["--profile", "prod", "--version"]):
+        if record.exists():
+            record.unlink()
+        run = subprocess.run([str(link), *argv], capture_output=True, text=True, check=False)
+        assert run.returncode == 0, run.stderr
+        assert "direct " + " ".join(argv) in run.stdout
+        assert not record.exists(), f"{argv} must not be Doppler-wrapped"
