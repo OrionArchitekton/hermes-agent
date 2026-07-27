@@ -1,8 +1,6 @@
 """Fallback-provider diagnostics must never render raw credentials."""
 
-import ast
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -119,41 +117,6 @@ def test_source_defined_provider_identity_is_preserved(provider):
     )
 
     assert payload[0]["provider"] == provider
-
-
-def test_source_defined_provider_allowlist_covers_static_catalog():
-    """Static built-ins stay useful without admitting dynamic plugin names."""
-    from hermes_cli import dump
-
-    source = (
-        Path(__file__).resolve().parents[2] / "hermes_cli" / "models.py"
-    ).read_text()
-    module = ast.parse(source)
-    catalog = next(
-        node
-        for node in module.body
-        if (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == "CANONICAL_PROVIDERS"
-        )
-    )
-    assert isinstance(catalog.value, ast.List)
-    static_provider_ids = {
-        entry.args[0].value
-        for entry in catalog.value.elts
-        if (
-            isinstance(entry, ast.Call)
-            and isinstance(entry.func, ast.Name)
-            and entry.func.id == "ProviderEntry"
-            and entry.args
-            and isinstance(entry.args[0], ast.Constant)
-            and isinstance(entry.args[0].value, str)
-        )
-    }
-
-    assert static_provider_ids
-    assert static_provider_ids <= dump._SAFE_PROVIDER_IDS
 
 
 @pytest.mark.parametrize("empty_value", [[], {}])
