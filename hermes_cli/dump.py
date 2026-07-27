@@ -270,16 +270,19 @@ _SAFE_BASE_VERSION_SEGMENT_RE = re.compile(r"v\d+(?:alpha\d*|beta\d*)?\Z", re.IG
 
 def _secret_display(value: Any, *, show_keys: bool) -> str:
     """Render a secret with the dump command's existing display semantics."""
-    if value is None or value == "":
+    value_type = type(value)
+    if value is None:
+        return "not set"
+    if value_type is str and value == "":
         return "not set"
     if not show_keys:
         return "set"
     try:
-        if isinstance(value, str):
+        if value_type is str:
             return _redact(value)
-        if isinstance(value, (bytes, bytearray)):
+        if value_type in (bytes, bytearray):
             return _redact(bytes(value).decode("utf-8", errors="replace"))
-        if isinstance(value, (bool, float, int)):
+        if value_type in (bool, float, int):
             return _redact(str(value))
     except Exception:
         pass

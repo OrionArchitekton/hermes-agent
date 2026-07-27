@@ -27,6 +27,34 @@ class _ExplodingFallback:
         return f"_ExplodingFallback(secret={self.secret!r})"
 
 
+class _ExplodingCredential:
+    def __init__(self, *, secret: str) -> None:
+        self.secret = secret
+
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError(self.secret)
+
+    def __repr__(self) -> str:
+        return f"_ExplodingCredential(secret={self.secret!r})"
+
+
+class _ExplodingString(str):
+    def __new__(cls, *, secret: str):
+        return super().__new__(cls, secret)
+
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError("credential equality must not run")
+
+    def __len__(self) -> int:
+        raise RuntimeError("credential length must not run")
+
+    def __str__(self) -> str:
+        raise RuntimeError("credential stringification must not run")
+
+    def __repr__(self) -> str:
+        return "_ExplodingString(<sensitive>)"
+
+
 def _fallback_payload(config: dict, *, show_keys: bool = False):
     from hermes_cli import dump
 
@@ -130,6 +158,47 @@ def test_unsupported_fallback_container_never_uses_truthiness_or_repr():
     assert payload == "<invalid fallback_providers>"
     assert secret not in rendered
     assert "_ExplodingFallback" not in rendered
+
+
+@pytest.mark.parametrize(
+    "credential_type",
+    [_ExplodingCredential, _ExplodingString],
+)
+@pytest.mark.parametrize("show_keys", [False, True])
+def test_credential_object_with_exploding_equality_is_redacted_locally(
+    show_keys,
+    credential_type,
+):
+    secret = "equality-exception-opaque-secret-material-123456"
+    config = {
+        "fallback_providers": [
+            {
+                "provider": "custom",
+                "model": "diagnostic-model",
+                "api_key": credential_type(secret=secret),
+            },
+        ],
+    }
+
+    payload, rendered = _fallback_payload(config, show_keys=show_keys)
+
+    assert payload == [
+        {
+            "provider": "custom",
+            "model": "diagnostic-model",
+            "api_key": "set" if not show_keys else "***",
+        },
+    ]
+    assert secret not in rendered
+    assert credential_type.__name__ not in rendered
+
+
+@pytest.mark.parametrize("show_keys", [False, True])
+def test_secret_display_preserves_not_set_for_none_and_empty_string(show_keys):
+    from hermes_cli import dump
+
+    assert dump._secret_display(None, show_keys=show_keys) == "not set"
+    assert dump._secret_display("", show_keys=show_keys) == "not set"
 
 
 def test_unknown_secret_fields_and_header_shapes_are_fail_closed():
