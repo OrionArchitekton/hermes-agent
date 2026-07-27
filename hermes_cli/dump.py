@@ -9,12 +9,11 @@ No ANSI colors, no checkmarks — just data.
 import json
 import os
 import platform
-import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 from hermes_cli.config import get_hermes_home, get_env_path, get_project_root, load_config
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -237,17 +236,67 @@ _FALLBACK_DIAGNOSTIC_FIELDS = (
     "api_key",
 )
 _FALLBACK_DIAGNOSTIC_FIELD_SET = frozenset(_FALLBACK_DIAGNOSTIC_FIELDS)
-_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}\Z")
-_OPAQUE_TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_-]{20,}\Z")
-_UUID_TOKEN_RE = re.compile(
-    r"[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\Z",
-    re.IGNORECASE,
-)
-_SAFE_MODEL_NAMESPACE_RE = re.compile(
-    r"(?:[a-z][a-z0-9]*(?:-[a-z0-9]+)*|"
-    r"MiniMaxAI|NousResearch|Qwen|XiaomiMiMo)\Z",
-)
-_BEARER_VALUE_RE = re.compile(r"(?i)(?:basic|bearer)\s+\S+\Z")
+_SAFE_PROVIDER_IDS = frozenset({
+    "alibaba",
+    "alibaba-coding-plan",
+    "anthropic",
+    "arcee",
+    "azure-foundry",
+    "bedrock",
+    "copilot",
+    "copilot-acp",
+    "custom",
+    "deepseek",
+    "gemini",
+    "gmi",
+    "huggingface",
+    "kilocode",
+    "kimi-coding",
+    "kimi-coding-cn",
+    "lmstudio",
+    "minimax",
+    "minimax-cn",
+    "minimax-oauth",
+    "moa",
+    "nous",
+    "nvidia",
+    "ollama",
+    "ollama-cloud",
+    "openai-api",
+    "openai-codex",
+    "opencode-go",
+    "opencode-zen",
+    "openrouter",
+    "qwen-oauth",
+    "stepfun",
+    "tencent-tokenhub",
+    "xai",
+    "xai-oauth",
+    "xiaomi",
+    "zai",
+})
+_SAFE_PUBLIC_ENDPOINT_HOSTS = frozenset({
+    "api.anthropic.com",
+    "api.arcee.ai",
+    "api.deepseek.com",
+    "api.gmi-serving.com",
+    "api.githubcopilot.com",
+    "api.kimi.com",
+    "api.minimax.io",
+    "api.minimaxi.com",
+    "api.moonshot.ai",
+    "api.moonshot.cn",
+    "api.openai.com",
+    "api.stepfun.ai",
+    "api.stepfun.com",
+    "api.x.ai",
+    "api.xiaomimimo.com",
+    "api.z.ai",
+    "generativelanguage.googleapis.com",
+    "ollama.com",
+    "openrouter.ai",
+    "portal.qwen.ai",
+})
 _SAFE_API_MODES = frozenset({
     "anthropic_messages",
     "bedrock_converse",
@@ -265,7 +314,14 @@ _SAFE_BASE_PATH_SEGMENTS = frozenset({
     "openai",
     "responses",
 })
-_SAFE_BASE_VERSION_SEGMENT_RE = re.compile(r"v\d+(?:alpha\d*|beta\d*)?\Z", re.IGNORECASE)
+_SAFE_BASE_VERSION_SEGMENTS = frozenset({
+    "v1",
+    "v1alpha",
+    "v1beta",
+    "v2",
+    "v3",
+    "v4",
+})
 
 
 def _secret_display(value: Any, *, show_keys: bool) -> str:
@@ -273,7 +329,11 @@ def _secret_display(value: Any, *, show_keys: bool) -> str:
     value_type = type(value)
     if value is None:
         return "not set"
-    if value_type is str and value == "":
+    if value_type is str and not value.strip():
+        return "not set"
+    if value_type in (bool, float, int) and not value:
+        return "not set"
+    if value_type in (bytes, bytearray) and not value:
         return "not set"
     if not show_keys:
         return "set"
@@ -291,102 +351,40 @@ def _secret_display(value: Any, *, show_keys: bool) -> str:
     return "***"
 
 
-def _redacted_text(value: str) -> str:
-    """Apply the strict, non-optional text redactor at this support boundary."""
-    from agent.redact import redact_sensitive_text
-
-    return redact_sensitive_text(
-        value,
-        force=True,
-        redact_url_credentials=True,
-    )
-
-
-def _looks_like_secret_value(value: str) -> bool:
-    """Detect recognizable credentials even when their field name is unknown."""
-    if _BEARER_VALUE_RE.fullmatch(value.strip()):
-        return True
-    try:
-        return _redacted_text(value) != value
-    except Exception:
-        # Diagnostic output must fail closed. A redactor failure is not
-        # permission to print the original scalar.
-        return True
-
-
-def _looks_like_opaque_token(value: str) -> bool:
-    """Conservatively recognize high-entropy-looking literal credentials."""
-    candidate = value.strip()
-    if not _OPAQUE_TOKEN_RE.fullmatch(candidate):
-        return False
-    if _UUID_TOKEN_RE.fullmatch(candidate):
-        return True
-    if (
-        len(candidate) >= 20
-        and re.fullmatch(r"[a-z0-9]+", candidate, re.IGNORECASE)
-        and any(char.isalpha() for char in candidate)
-        and any(char.isdigit() for char in candidate)
-    ):
-        return True
-    has_upper = any(char.isupper() for char in candidate)
-    has_lower = any(char.islower() for char in candidate)
-    has_digit = any(char.isdigit() for char in candidate)
-    if has_upper and has_lower and has_digit:
-        return True
-    return (
-        has_upper
-        and has_digit
-        and "_" not in candidate
-        and "-" not in candidate
-    )
-
-
-def _looks_like_structured_namespaced_model(value: str) -> bool:
-    """Recognize shipped vendor/model syntax without accepting arbitrary '/'."""
-    if value.count("/") != 1:
-        return False
-    namespace, model = value.split("/", 1)
-    if not _SAFE_MODEL_NAMESPACE_RE.fullmatch(namespace):
-        return False
-    separators = re.findall(r"[-._:]", model)
-    words = re.split(r"[-._:]+", model)
-    return (
-        len(separators) >= 2
-        and any(len(word) >= 3 and word.isalpha() for word in words)
-    )
-
-
-def _safe_identifier(value: Any, *, allow_namespaced_model: bool = False) -> str:
-    """Render a provider/model identifier without coercing arbitrary objects."""
-    if not isinstance(value, str):
+def _safe_provider(value: Any) -> str:
+    """Render only a source-reviewed provider identifier."""
+    if type(value) is not str:
         return "<invalid>"
-    candidate = value.strip()
+    candidate = value.strip().casefold()
     if not candidate:
         return "(not set)"
-    if not _IDENTIFIER_RE.fullmatch(candidate):
+    return candidate if candidate in _SAFE_PROVIDER_IDS else "<custom/unknown>"
+
+
+def _safe_model_status(value: Any) -> str:
+    """Report model presence without disclosing environment-expanded bytes."""
+    if type(value) is not str:
         return "<invalid>"
-    looks_like_opaque_token = (
-        _looks_like_opaque_token(candidate)
-        and not (
-            allow_namespaced_model
-            and _looks_like_structured_namespaced_model(candidate)
-        )
-    )
-    if _looks_like_secret_value(candidate) or looks_like_opaque_token:
-        return "<redacted>"
-    return candidate
+    return "configured" if value.strip() else "(not set)"
 
 
 def _safe_enum(value: Any, *, allowed: frozenset[str]) -> str:
     """Render a documented routing enum and suppress unexpected scalar data."""
-    if isinstance(value, str) and value in allowed:
+    if type(value) is str and value in allowed:
         return value
     return "<invalid>"
 
 
 def _safe_env_reference(value: Any) -> str:
     """Report reference presence without trying to distinguish names from keys."""
-    if value is None or (isinstance(value, str) and value == ""):
+    value_type = type(value)
+    if value is None:
+        return "not set"
+    if value_type is str and not value.strip():
+        return "not set"
+    if value_type in (bool, float, int) and not value:
+        return "not set"
+    if value_type in (bytes, bytearray) and not value:
         return "not set"
     # A credential can be deliberately or accidentally shaped exactly like an
     # uppercase environment name. No syntax test can authorize its bytes.
@@ -395,7 +393,7 @@ def _safe_env_reference(value: Any) -> str:
 
 def _safe_base_url(value: Any) -> str:
     """Retain endpoint routing without URL-carried credentials or private data."""
-    if not isinstance(value, str):
+    if type(value) is not str:
         return "<invalid>"
     candidate = value.strip()
     if not candidate:
@@ -404,23 +402,19 @@ def _safe_base_url(value: Any) -> str:
         parsed = urlsplit(candidate)
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
             return "<invalid>"
-        hostname = parsed.hostname
-        if any(
-            _looks_like_secret_value(label) or _looks_like_opaque_token(label)
-            for label in hostname.split(".")
-        ):
-            return "<redacted endpoint>"
-        if ":" in hostname and not hostname.startswith("["):
-            hostname = f"[{hostname}]"
-        port = parsed.port
-        netloc = f"{hostname}:{port}" if port is not None else hostname
+        hostname = parsed.hostname.casefold()
+        displayed_host = (
+            hostname
+            if hostname in _SAFE_PUBLIC_ENDPOINT_HOSTS
+            else "<custom-endpoint>"
+        )
 
         path = parsed.path
         if path and path != "/":
-            segments = [unquote(segment) for segment in path.split("/") if segment]
+            segments = [segment.casefold() for segment in path.split("/") if segment]
             if all(
                 segment.lower() in _SAFE_BASE_PATH_SEGMENTS
-                or _SAFE_BASE_VERSION_SEGMENT_RE.fullmatch(segment)
+                or segment in _SAFE_BASE_VERSION_SEGMENTS
                 for segment in segments
             ):
                 path = "/" + "/".join(segments)
@@ -430,7 +424,7 @@ def _safe_base_url(value: Any) -> str:
         # Userinfo is removed while rebuilding netloc. Query strings and
         # fragments are omitted wholesale because custom gateways commonly
         # carry opaque credentials in names that no denylist can enumerate.
-        return urlunsplit((parsed.scheme.lower(), netloc, path, "", ""))
+        return f"{parsed.scheme.lower()}://{displayed_host}{path}"
     except Exception:
         return "<invalid>"
 
@@ -449,11 +443,10 @@ def _sanitize_fallback_entry(
         if field not in entry:
             continue
         value = entry[field]
-        if field in {"provider", "model"}:
-            sanitized[field] = _safe_identifier(
-                value,
-                allow_namespaced_model=field == "model",
-            )
+        if field == "provider":
+            sanitized[field] = _safe_provider(value)
+        elif field == "model":
+            sanitized[field] = _safe_model_status(value)
         elif field == "base_url":
             sanitized[field] = _safe_base_url(value)
         elif field == "api_mode":

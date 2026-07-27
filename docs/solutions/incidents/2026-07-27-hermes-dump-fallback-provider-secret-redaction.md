@@ -53,10 +53,14 @@ The dump formatter now converts fallback-provider diagnostics into a JSON-safe
 structure before rendering it. The diagnostic schema is intentionally
 narrower than the permissive runtime mapping:
 
-- it retains only the runtime-relevant `provider`, `model`, `base_url`,
+- it considers only the runtime-relevant `provider`, `model`, `base_url`,
   `api_mode`, `transport`, `key_env`, `api_key_env`, and `api_key` fields;
-- it removes URL userinfo, query strings, fragments, and arbitrary path
-  segments while retaining the endpoint host and common API routing paths;
+- it renders only source-reviewed provider identifiers, reports model presence
+  without emitting model bytes, and replaces unknown endpoint hosts with a
+  fixed custom-endpoint marker;
+- it removes URL userinfo, ports, query strings, fragments, and arbitrary path
+  segments while retaining only reviewed public hosts and common API routing
+  paths;
 - it reports only whether an environment reference is configured, never the
   reference bytes, because a credential can be shaped like an environment
   variable name;
@@ -66,9 +70,10 @@ narrower than the permissive runtime mapping:
 - it applies the existing `--show-keys` first/last-four masked fingerprint
   rather than introducing another disclosure flag.
 
-The allowlist is the disclosure authorization rule. Credential-pattern
-redaction remains defense in depth for the allowed scalar fields, not the
-mechanism trusted to classify arbitrary nested data.
+The allowlist is the disclosure authorization rule. No heuristic attempts to
+distinguish an arbitrary identifier or hostname from a credential: environment
+expansion can place secret bytes in nominal `model` and `base_url` fields, so
+unrecognized scalar values are represented only by fixed markers.
 
 This source change does not by itself change the deployed Hermes runtime or any
 credential.
@@ -92,11 +97,15 @@ python scripts/check-windows-footguns.py --all
 ```
 
 The regression asserts that nested mapping, list, object, header, and
-credential-pattern cases are omitted without traversal, while the provider,
-model, sanitized endpoint, routing mode, and environment-reference presence
-remain useful. A temp-`HERMES_HOME` test exercises `config.yaml` loading through
-`run_dump` under both default and `--show-keys` modes and proves that no complete
-synthetic credential reaches standard output or standard error.
+credential-pattern cases are omitted without traversal, while reviewed
+provider identity, model presence, sanitized endpoint class, routing mode, and
+environment-reference presence remain useful. Temp-`HERMES_HOME` tests
+exercise `config.yaml` plus `.env` expansion through `run_dump` under both
+default and `--show-keys` modes. They also exercise the real
+`collect_share_bundle` path with downstream redaction both enabled and disabled,
+proving that lowercase, letters-only synthetic credentials in model and
+hostname positions never reach the collected report, standard output, or
+standard error.
 
 ## Remaining operator gates
 

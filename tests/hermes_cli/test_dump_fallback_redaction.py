@@ -74,7 +74,7 @@ def test_known_fallback_fields_preserve_safe_routing_and_mask_credentials():
             {
                 "provider": "custom",
                 "model": "diagnostic-model",
-                "base_url": "https://fallback.example/v1",
+                "base_url": "https://api.openai.com/v1",
                 "api_mode": "chat_completions",
                 "transport": "openai_chat",
                 "key_env": "CUSTOM_FALLBACK_API_KEY",
@@ -88,8 +88,8 @@ def test_known_fallback_fields_preserve_safe_routing_and_mask_credentials():
     assert payload == [
         {
             "provider": "custom",
-            "model": "diagnostic-model",
-            "base_url": "https://fallback.example/v1",
+            "model": "configured",
+            "base_url": "https://api.openai.com/v1",
             "api_mode": "chat_completions",
             "transport": "openai_chat",
             "key_env": "configured",
@@ -135,7 +135,7 @@ def test_unknown_nested_fields_are_omitted_without_traversing_or_stringifying():
         assert payload == [
             {
                 "provider": "custom",
-                "model": "diagnostic-model",
+                "model": "configured",
                 "omitted_fields": 3,
             },
         ]
@@ -185,7 +185,7 @@ def test_credential_object_with_exploding_equality_is_redacted_locally(
     assert payload == [
         {
             "provider": "custom",
-            "model": "diagnostic-model",
+            "model": "configured",
             "api_key": "set" if not show_keys else "***",
         },
     ]
@@ -199,6 +199,20 @@ def test_secret_display_preserves_not_set_for_none_and_empty_string(show_keys):
 
     assert dump._secret_display(None, show_keys=show_keys) == "not set"
     assert dump._secret_display("", show_keys=show_keys) == "not set"
+    assert dump._secret_display(" \t", show_keys=show_keys) == "not set"
+    assert dump._secret_display(False, show_keys=show_keys) == "not set"
+    assert dump._secret_display(0, show_keys=show_keys) == "not set"
+    assert dump._secret_display(0.0, show_keys=show_keys) == "not set"
+
+
+@pytest.mark.parametrize("show_keys", [False, True])
+def test_environment_reference_presence_matches_runtime_falsy_semantics(show_keys):
+    from hermes_cli import dump
+
+    for value in (None, "", " \t", False, 0, 0.0):
+        assert dump._safe_env_reference(value) == "not set"
+    for value in ("CUSTOM_KEY", True, 1, 1.0):
+        assert dump._safe_env_reference(value) == "configured"
 
 
 def test_unknown_secret_fields_and_header_shapes_are_fail_closed():
@@ -238,7 +252,7 @@ def test_unknown_secret_fields_and_header_shapes_are_fail_closed():
         payload, rendered = _fallback_payload(config, show_keys=show_keys)
 
         assert payload[0]["provider"] == "custom"
-        assert payload[0]["model"] == "diagnostic-model"
+        assert payload[0]["model"] == "configured"
         assert payload[0]["omitted_fields"] == 6
         for secret in secrets.values():
             assert secret not in rendered
@@ -311,7 +325,7 @@ def test_environment_reference_fields_report_presence_without_emitting_bytes():
         assert value not in shown_rendered
 
 
-def test_model_ids_remain_useful_while_unstructured_tokens_are_omitted():
+def test_provider_allowlist_and_model_presence_never_emit_arbitrary_bytes():
     opaque_token = "a1b2c3d4" * 5
     hyphenated_token = "Q7m4V2p9-" + "L8s6N3x5R1c0-secret"
     mixed_provider_value = "Ab1Cd2Ef3Gh4-" + "Ij5Kl6Mn7Op8-Qr9St0Uv1Wx2"
@@ -357,22 +371,22 @@ def test_model_ids_remain_useful_while_unstructured_tokens_are_omitted():
 
     payload, rendered = _fallback_payload(config)
 
-    assert payload[0]["provider"] == "<redacted>"
-    assert payload[0]["model"] == "Qwen/Qwen3-Coder-480B-A35B-Instruct"
+    assert payload[0]["provider"] == "<custom/unknown>"
+    assert payload[0]["model"] == "configured"
     assert payload[1]["provider"] == "custom"
-    assert payload[1]["model"] == "<redacted>"
+    assert payload[1]["model"] == "configured"
     assert payload[2]["provider"] == "custom"
-    assert payload[2]["model"] == "<redacted>"
-    assert payload[3]["provider"] == "<redacted>"
-    assert payload[3]["model"] == "diagnostic-model"
+    assert payload[2]["model"] == "configured"
+    assert payload[3]["provider"] == "<custom/unknown>"
+    assert payload[3]["model"] == "configured"
     assert payload[4]["provider"] == "custom"
-    assert payload[4]["model"] == "<redacted>"
+    assert payload[4]["model"] == "configured"
     assert payload[5]["provider"] == "custom"
-    assert payload[5]["model"] == "<redacted>"
+    assert payload[5]["model"] == "configured"
     assert payload[6]["provider"] == "custom"
-    assert payload[6]["model"] == "<redacted>"
+    assert payload[6]["model"] == "configured"
     assert payload[7]["provider"] == "custom"
-    assert payload[7]["model"] == "XiaomiMiMo/MiMo-V2-Flash"
+    assert payload[7]["model"] == "configured"
     for secret in (
         opaque_token,
         hyphenated_token,
@@ -421,11 +435,11 @@ def test_base_url_omits_userinfo_query_fragment_and_opaque_paths():
     for show_keys in (False, True):
         payload, rendered = _fallback_payload(config, show_keys=show_keys)
 
-        assert payload[0]["base_url"] == "https://fallback.example/<path-omitted>"
-        assert payload[1]["base_url"] == "<redacted endpoint>"
-        assert payload[2]["base_url"] == "<redacted endpoint>"
-        assert payload[3]["base_url"] == "<redacted endpoint>"
-        assert "fallback.example" in rendered
+        assert payload[0]["base_url"] == "https://<custom-endpoint>/<path-omitted>"
+        assert payload[1]["base_url"] == "https://<custom-endpoint>/v1"
+        assert payload[2]["base_url"] == "https://<custom-endpoint>/v1"
+        assert payload[3]["base_url"] == "https://<custom-endpoint>/v1"
+        assert "fallback.example" not in rendered
         for secret in (
             "synthetic-user",
             "synthetic-password",
@@ -504,8 +518,10 @@ def test_run_dump_loads_temp_config_and_never_emits_nested_plaintext(
     captured = capsys.readouterr()
 
     assert "fallback_providers" in captured.out
-    assert "diagnostic-model" in captured.out
-    assert "https://fallback.example/v1" in captured.out
+    assert '"model": "configured"' in captured.out
+    assert '"base_url": "https://<custom-endpoint>/v1"' in captured.out
+    assert "diagnostic-model" not in captured.out
+    assert "fallback.example" not in captured.out
     assert '"omitted_fields": 1' in captured.out
     if show_keys:
         assert dump._redact(inline_key) in captured.out
@@ -514,3 +530,98 @@ def test_run_dump_loads_temp_config_and_never_emits_nested_plaintext(
     for secret in (inline_key, nested_key):
         assert secret not in captured.out
         assert secret not in captured.err
+
+
+@pytest.mark.parametrize("show_keys", [False, True])
+def test_run_dump_never_emits_env_expanded_identifier_or_endpoint(
+    monkeypatch,
+    capsys,
+    tmp_path,
+    show_keys,
+):
+    """Nominal routing fields are not authority to disclose expanded env bytes."""
+    from hermes_cli import dump
+    from hermes_cli.config import get_hermes_home
+
+    secret = "correcthorsebatterystaple"
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "fallback_providers": [
+                    {
+                        "provider": "custom",
+                        "model": "${SYNTHETIC_FALLBACK_SECRET}",
+                        "base_url": (
+                            "https://${SYNTHETIC_FALLBACK_SECRET}.gateway.example/v1"
+                        ),
+                    },
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (home / ".env").write_text(
+        f"SYNTHETIC_FALLBACK_SECRET={secret}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dump, "get_project_root", lambda: tmp_path / "noproject")
+    monkeypatch.setattr(dump, "_gateway_status", lambda: "stopped (test)")
+
+    dump.run_dump(SimpleNamespace(show_keys=show_keys))
+    captured = capsys.readouterr()
+
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert '"provider": "custom"' in captured.out
+    assert '"model": "configured"' in captured.out
+    assert '"base_url": "https://<custom-endpoint>/v1"' in captured.out
+
+
+@pytest.mark.parametrize("redact", [False, True])
+def test_debug_share_bundle_never_captures_env_expanded_routing_bytes(
+    monkeypatch,
+    tmp_path,
+    redact,
+):
+    """Exercise the real dump header collected by both debug-share destinations."""
+    from hermes_cli import dump
+    from hermes_cli.config import get_hermes_home
+    from hermes_cli.debug import collect_share_bundle
+
+    secret = "lettersonlysyntheticcredential"
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "fallback_providers": [
+                    {
+                        "provider": "custom",
+                        "model": "${SYNTHETIC_FALLBACK_SECRET}",
+                        "base_url": (
+                            "https://${SYNTHETIC_FALLBACK_SECRET}.gateway.example/v1"
+                        ),
+                    },
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (home / ".env").write_text(
+        f"SYNTHETIC_FALLBACK_SECRET={secret}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dump, "get_project_root", lambda: tmp_path / "noproject")
+    monkeypatch.setattr(dump, "_gateway_status", lambda: "stopped (test)")
+
+    bundle = collect_share_bundle(log_lines=1, redact=redact)
+    rendered = "\n".join(bundle.values())
+
+    assert "fallback_providers" in rendered
+    assert secret not in rendered
+    assert '"model": "configured"' in rendered
+    assert '"base_url": "https://<custom-endpoint>/v1"' in rendered
