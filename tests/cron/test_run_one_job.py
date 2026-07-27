@@ -129,14 +129,11 @@ def test_run_one_job_failed_job_delivers_available_final_response(monkeypatch):
     ok = s.run_one_job({"id": "j7", "name": "pr-digest"})
 
     assert ok is True
-    # Upstream v2026.7.20 delivers a uniform failure summary rather than the
-    # agent's raw final_response on the failure path (_summarize_cron_failure_for_delivery).
-    # The runbook protection this test guards is the FAILED STATUS below, not the
-    # delivered text; the operator still receives the error either way.
-    assert delivered == [
-        "\u26a0\ufe0f Cron 'pr-digest' failed: pre-run script output reported "
-        "failure (rc=124): ALERT pr-digest failed"
-    ]
+    # A failed job that still produced a real report must DELIVER that report
+    # (estate 9d5e69c6d). _summarize_cron_failure_for_delivery never sees
+    # final_response and truncates to 180 chars, so relying on it hides the agent's
+    # actual work in chat even though it is saved to the output dir.
+    assert delivered == ["detailed pre-run script failure report"]
     assert marks == [
         (
             "j7",
@@ -320,3 +317,37 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
     assert ok is False
     assert "deliver" not in order
     assert order == ["save-raise", "agent.close", "cleanup_stale"], order
+
+
+def test_run_one_job_interrupted_run_delivers_honest_summary(monkeypatch):
+    """An interrupted run delivers the honest summary, NOT its plausible final_response.
+
+    Upstream #60432 forces the failure path when the gateway shutdown killed the tool
+    subprocess mid-flight, because the agent may still have produced a confident-looking
+    response from truncated output. The estate "preserve failed job reports" behavior
+    must not re-deliver that response.
+    """
+    delivered = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        return (True, "saved output", "plausible but truncated answer", None)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "_is_interrupted", lambda jid: True)
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda job, content, adapters=None, loop=None: delivered.append(content),
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None: None,
+    )
+
+    s.run_one_job({"id": "j8", "name": "pr-digest"})
+
+    assert delivered, "interrupted run must still deliver something"
+    assert "plausible but truncated answer" not in delivered[0]
+    assert "nterrupted" in delivered[0]

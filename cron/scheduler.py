@@ -3863,6 +3863,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
         delivery_error = None
+        interrupted_run = False
         try:
             output_file = save_job_output(job["id"], output)
             if verbose:
@@ -3877,6 +3878,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # right before mark_job_run below.
             if success and _is_interrupted(job["id"]):
                 success = False
+                interrupted_run = True
                 error = (
                     "Interrupted by gateway shutdown before the run finished "
                     "(tool subprocess was killed mid-flight)."
@@ -3885,7 +3887,21 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
-            deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            # ESTATE FIX (re-applied over upstream v2026.7.20, originally 9d5e69c6d
+            # "fix(cron): preserve failed job reports"): when a job FAILS but the agent
+            # still produced a real report, deliver the report. Otherwise the operator
+            # receives only `_summarize_cron_failure_for_delivery`, which never sees
+            # final_response and truncates to 180 chars, so the actual work is invisible
+            # in chat even though it is saved to the output dir.
+            #
+            # EXCEPT when the run was interrupted: #60432 above deliberately forces the
+            # failure path precisely because final_response may be a plausible-looking
+            # answer built from truncated output. Delivering it would defeat that guard,
+            # so an interrupted run keeps the honest summary.
+            if success or (final_response.strip() and not interrupted_run):
+                deliver_content = final_response
+            else:
+                deliver_content = _summarize_cron_failure_for_delivery(job, error)
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
