@@ -9,9 +9,12 @@ No ANSI colors, no checkmarks — just data.
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from hermes_cli.config import get_hermes_home, get_env_path, get_project_root, load_config
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -223,7 +226,265 @@ def _get_model_and_provider(config: dict) -> tuple[str, str]:
     return model, provider
 
 
-def _config_overrides(config: dict) -> dict[str, str]:
+_FALLBACK_DIAGNOSTIC_FIELDS = (
+    "provider",
+    "model",
+    "base_url",
+    "api_mode",
+    "transport",
+    "key_env",
+    "api_key_env",
+    "api_key",
+)
+_FALLBACK_DIAGNOSTIC_FIELD_SET = frozenset(_FALLBACK_DIAGNOSTIC_FIELDS)
+_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}\Z")
+_OPAQUE_TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_-]{20,}\Z")
+_UUID_TOKEN_RE = re.compile(
+    r"[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\Z",
+    re.IGNORECASE,
+)
+_SAFE_MODEL_NAMESPACE_RE = re.compile(
+    r"(?:[a-z][a-z0-9]*(?:-[a-z0-9]+)*|"
+    r"MiniMaxAI|NousResearch|Qwen|XiaomiMiMo)\Z",
+)
+_BEARER_VALUE_RE = re.compile(r"(?i)(?:basic|bearer)\s+\S+\Z")
+_SAFE_API_MODES = frozenset({
+    "anthropic_messages",
+    "bedrock_converse",
+    "chat_completions",
+    "codex_app_server",
+    "codex_responses",
+})
+_SAFE_TRANSPORTS = _SAFE_API_MODES | {"auto", "openai_chat"}
+_SAFE_BASE_PATH_SEGMENTS = frozenset({
+    "anthropic",
+    "api",
+    "chat",
+    "completions",
+    "models",
+    "openai",
+    "responses",
+})
+_SAFE_BASE_VERSION_SEGMENT_RE = re.compile(r"v\d+(?:alpha\d*|beta\d*)?\Z", re.IGNORECASE)
+
+
+def _secret_display(value: Any, *, show_keys: bool) -> str:
+    """Render a secret with the dump command's existing display semantics."""
+    if value is None or value == "":
+        return "not set"
+    if not show_keys:
+        return "set"
+    try:
+        if isinstance(value, str):
+            return _redact(value)
+        if isinstance(value, (bytes, bytearray)):
+            return _redact(bytes(value).decode("utf-8", errors="replace"))
+        if isinstance(value, (bool, float, int)):
+            return _redact(str(value))
+    except Exception:
+        pass
+    # Do not call repr()/str() on arbitrary credential objects. Their custom
+    # representation can itself expose the material this boundary protects.
+    return "***"
+
+
+def _redacted_text(value: str) -> str:
+    """Apply the strict, non-optional text redactor at this support boundary."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(
+        value,
+        force=True,
+        redact_url_credentials=True,
+    )
+
+
+def _looks_like_secret_value(value: str) -> bool:
+    """Detect recognizable credentials even when their field name is unknown."""
+    if _BEARER_VALUE_RE.fullmatch(value.strip()):
+        return True
+    try:
+        return _redacted_text(value) != value
+    except Exception:
+        # Diagnostic output must fail closed. A redactor failure is not
+        # permission to print the original scalar.
+        return True
+
+
+def _looks_like_opaque_token(value: str) -> bool:
+    """Conservatively recognize high-entropy-looking literal credentials."""
+    candidate = value.strip()
+    if not _OPAQUE_TOKEN_RE.fullmatch(candidate):
+        return False
+    if _UUID_TOKEN_RE.fullmatch(candidate):
+        return True
+    if (
+        len(candidate) >= 20
+        and re.fullmatch(r"[a-z0-9]+", candidate, re.IGNORECASE)
+        and any(char.isalpha() for char in candidate)
+        and any(char.isdigit() for char in candidate)
+    ):
+        return True
+    has_upper = any(char.isupper() for char in candidate)
+    has_lower = any(char.islower() for char in candidate)
+    has_digit = any(char.isdigit() for char in candidate)
+    if has_upper and has_lower and has_digit:
+        return True
+    return (
+        has_upper
+        and has_digit
+        and "_" not in candidate
+        and "-" not in candidate
+    )
+
+
+def _looks_like_structured_namespaced_model(value: str) -> bool:
+    """Recognize shipped vendor/model syntax without accepting arbitrary '/'."""
+    if value.count("/") != 1:
+        return False
+    namespace, model = value.split("/", 1)
+    if not _SAFE_MODEL_NAMESPACE_RE.fullmatch(namespace):
+        return False
+    separators = re.findall(r"[-._:]", model)
+    words = re.split(r"[-._:]+", model)
+    return (
+        len(separators) >= 2
+        and any(len(word) >= 3 and word.isalpha() for word in words)
+    )
+
+
+def _safe_identifier(value: Any, *, allow_namespaced_model: bool = False) -> str:
+    """Render a provider/model identifier without coercing arbitrary objects."""
+    if not isinstance(value, str):
+        return "<invalid>"
+    candidate = value.strip()
+    if not candidate:
+        return "(not set)"
+    if not _IDENTIFIER_RE.fullmatch(candidate):
+        return "<invalid>"
+    looks_like_opaque_token = (
+        _looks_like_opaque_token(candidate)
+        and not (
+            allow_namespaced_model
+            and _looks_like_structured_namespaced_model(candidate)
+        )
+    )
+    if _looks_like_secret_value(candidate) or looks_like_opaque_token:
+        return "<redacted>"
+    return candidate
+
+
+def _safe_enum(value: Any, *, allowed: frozenset[str]) -> str:
+    """Render a documented routing enum and suppress unexpected scalar data."""
+    if isinstance(value, str) and value in allowed:
+        return value
+    return "<invalid>"
+
+
+def _safe_env_reference(value: Any) -> str:
+    """Report reference presence without trying to distinguish names from keys."""
+    if value is None or (isinstance(value, str) and value == ""):
+        return "not set"
+    # A credential can be deliberately or accidentally shaped exactly like an
+    # uppercase environment name. No syntax test can authorize its bytes.
+    return "configured"
+
+
+def _safe_base_url(value: Any) -> str:
+    """Retain endpoint routing without URL-carried credentials or private data."""
+    if not isinstance(value, str):
+        return "<invalid>"
+    candidate = value.strip()
+    if not candidate:
+        return "(not set)"
+    try:
+        parsed = urlsplit(candidate)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return "<invalid>"
+        hostname = parsed.hostname
+        if any(
+            _looks_like_secret_value(label) or _looks_like_opaque_token(label)
+            for label in hostname.split(".")
+        ):
+            return "<redacted endpoint>"
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        port = parsed.port
+        netloc = f"{hostname}:{port}" if port is not None else hostname
+
+        path = parsed.path
+        if path and path != "/":
+            segments = [unquote(segment) for segment in path.split("/") if segment]
+            if all(
+                segment.lower() in _SAFE_BASE_PATH_SEGMENTS
+                or _SAFE_BASE_VERSION_SEGMENT_RE.fullmatch(segment)
+                for segment in segments
+            ):
+                path = "/" + "/".join(segments)
+            else:
+                path = "/<path-omitted>"
+
+        # Userinfo is removed while rebuilding netloc. Query strings and
+        # fragments are omitted wholesale because custom gateways commonly
+        # carry opaque credentials in names that no denylist can enumerate.
+        return urlunsplit((parsed.scheme.lower(), netloc, path, "", ""))
+    except Exception:
+        return "<invalid>"
+
+
+def _sanitize_fallback_entry(
+    entry: Any,
+    *,
+    show_keys: bool,
+) -> dict[str, Any] | str:
+    """Return only runtime-relevant fallback fields from a plain YAML mapping."""
+    if type(entry) is not dict:
+        return "<invalid fallback entry>"
+
+    sanitized: dict[str, Any] = {}
+    for field in _FALLBACK_DIAGNOSTIC_FIELDS:
+        if field not in entry:
+            continue
+        value = entry[field]
+        if field in {"provider", "model"}:
+            sanitized[field] = _safe_identifier(
+                value,
+                allow_namespaced_model=field == "model",
+            )
+        elif field == "base_url":
+            sanitized[field] = _safe_base_url(value)
+        elif field == "api_mode":
+            sanitized[field] = _safe_enum(value, allowed=_SAFE_API_MODES)
+        elif field == "transport":
+            sanitized[field] = _safe_enum(value, allowed=_SAFE_TRANSPORTS)
+        elif field in {"key_env", "api_key_env"}:
+            sanitized[field] = _safe_env_reference(value)
+        else:
+            sanitized[field] = _secret_display(value, show_keys=show_keys)
+
+    omitted_fields = sum(
+        1
+        for key in entry
+        if not isinstance(key, str) or key not in _FALLBACK_DIAGNOSTIC_FIELD_SET
+    )
+    if omitted_fields:
+        sanitized["omitted_fields"] = omitted_fields
+    return sanitized
+
+
+def _sanitize_fallback_providers(value: Any, *, show_keys: bool) -> Any:
+    """Sanitize the accepted dict/list shapes without traversing unknown data."""
+    if type(value) is dict:
+        return _sanitize_fallback_entry(value, show_keys=show_keys)
+    if type(value) is list:
+        return [
+            _sanitize_fallback_entry(entry, show_keys=show_keys)
+            for entry in value
+        ]
+    return "<invalid fallback_providers>"
+
+
+def _config_overrides(config: dict, *, show_keys: bool = False) -> dict[str, str]:
     """Find non-default config values worth reporting.
     
     Returns a flat dict of dotpath -> value for interesting overrides.
@@ -267,9 +528,26 @@ def _config_overrides(config: dict) -> dict[str, str]:
         overrides["toolsets"] = str(user_toolsets)
 
     # Fallback providers
-    fallbacks = config.get("fallback_providers", [])
-    if fallbacks:
-        overrides["fallback_providers"] = str(fallbacks)
+    try:
+        fallbacks = config.get("fallback_providers", [])
+        has_fallbacks = (
+            (type(fallbacks) in {dict, list} and len(fallbacks) > 0)
+            or (type(fallbacks) not in {dict, list} and fallbacks is not None)
+        )
+        if has_fallbacks:
+            sanitized_fallbacks = _sanitize_fallback_providers(
+                fallbacks,
+                show_keys=show_keys,
+            )
+            overrides["fallback_providers"] = json.dumps(
+                sanitized_fallbacks,
+                ensure_ascii=False,
+            )
+    except Exception:
+        # Diagnostic output is a security boundary. A malformed custom
+        # container must not turn its exception text into a second
+        # stringification path for credential material.
+        overrides["fallback_providers"] = '"<redaction failed>"'
 
     return overrides
 
@@ -433,7 +711,7 @@ def run_dump(args):
     lines.append(f"  skills:             {_count_skills(hermes_home)}")
 
     # Config overrides (non-default values)
-    overrides = _config_overrides(config)
+    overrides = _config_overrides(config, show_keys=show_keys)
     if overrides:
         lines.append("")
         lines.append("config_overrides:")
