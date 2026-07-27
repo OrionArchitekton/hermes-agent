@@ -336,6 +336,46 @@ def _is_kimi_model(model: Optional[str]) -> bool:
     return bare.startswith("kimi-") or bare == "kimi"
 
 
+# Anthropic model families that run with extended thinking enabled and therefore
+# reject a pinned temperature. Measured against the live provider 2026-07-26 with
+# temperature=0.7 (400 = rejects, 200 = accepts):
+#
+#     REJECTS : claude-sonnet-5, claude-opus-4-7, claude-opus-4-8, claude-fable-5
+#     ACCEPTS : claude-sonnet-4-6, claude-sonnet-4-5, claude-opus-4-6,
+#               claude-opus-4-5, claude-opus-4-1, claude-haiku-4-5
+#
+# Deliberately an explicit set, not "all Anthropic models". Upstream ships
+# ``test_non_kimi_models_preserve_temperature[anthropic/claude-sonnet-4-6]``, which
+# asserts the older models KEEP their temperature, and that contract is correct: those
+# models really do accept it. The two failure directions are not symmetric. Too narrow
+# means a newly released model gets one 400 and falls through to the next rung, which is
+# visible and recoverable. Too broad silently strips a caller's temperature on models
+# that honour it, and breaks the shipped contract. So when Anthropic ships a new
+# thinking model, ADD IT HERE after measuring, rather than widening to the family.
+_ANTHROPIC_THINKING_FAMILIES = (
+    "claude-sonnet-5",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-fable-5",
+)
+
+
+def _is_anthropic_thinking_model(model: Optional[str]) -> bool:
+    """True for Anthropic models that reject a pinned temperature.
+
+    Tolerates the vendor prefix (``anthropic/``), a ``-subscription`` suffix, and
+    dated variants (``claude-opus-4-8-20261115``), while excluding both older
+    Anthropic models and lookalikes such as ``claudia-7b``.
+    """
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if not bare:
+        return False
+    return any(
+        bare == fam or bare.startswith(fam + "-")
+        for fam in _ANTHROPIC_THINKING_FAMILIES
+    )
+
+
 def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
     """True for Arcee Trinity Large Thinking (direct or via OpenRouter)."""
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
@@ -429,6 +469,19 @@ def _fixed_temperature_for_model(
         return OMIT_TEMPERATURE
     if _is_arcee_trinity_thinking(model):
         return 0.5
+    if _is_anthropic_thinking_model(model):
+        # ESTATE FIX 2026-07-26: these Anthropic models run with extended thinking
+        # enabled and reject any pinned temperature other than 1. Through an
+        # OpenAI-compatible proxy the rejection arrives as an opaque
+        # "400 Bad request to upstream provider", carrying neither the word
+        # "temperature" nor an "unsupported parameter" marker, so
+        # _is_unsupported_parameter_error cannot classify it and the reactive
+        # retry-without-temperature path below never fires. Omit it up front.
+        logger.debug(
+            "Omitting temperature for Anthropic thinking model %r (temperature must be 1)",
+            model,
+        )
+        return OMIT_TEMPERATURE
     return None
 
 
