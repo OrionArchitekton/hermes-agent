@@ -329,7 +329,14 @@ _SAFE_BASE_VERSION_SEGMENTS = frozenset({
 
 def _is_known_empty_container(value: Any) -> bool:
     """Match YAML's empty built-in containers without invoking user code."""
-    if type(value) in (dict, list, set, tuple, frozenset):
+    value_type = type(value)
+    if (
+        value_type is dict
+        or value_type is list
+        or value_type is set
+        or value_type is tuple
+        or value_type is frozenset
+    ):
         return len(value) == 0
     return False
 
@@ -341,9 +348,9 @@ def _secret_display(value: Any, *, show_keys: bool) -> str:
         return "not set"
     if value_type is str and not value.strip():
         return "not set"
-    if value_type in (bool, float, int) and not value:
+    if (value_type is bool or value_type is float or value_type is int) and not value:
         return "not set"
-    if value_type in (bytes, bytearray) and not value:
+    if (value_type is bytes or value_type is bytearray) and not value:
         return "not set"
     if _is_known_empty_container(value):
         return "not set"
@@ -352,9 +359,9 @@ def _secret_display(value: Any, *, show_keys: bool) -> str:
     try:
         if value_type is str:
             return _redact(value)
-        if value_type in (bytes, bytearray):
+        if value_type is bytes or value_type is bytearray:
             return _redact(bytes(value).decode("utf-8", errors="replace"))
-        if value_type in (bool, float, int):
+        if value_type is bool or value_type is float or value_type is int:
             return _redact(str(value))
     except Exception:
         pass
@@ -367,7 +374,7 @@ def _safe_provider(value: Any) -> str:
     """Render only a source-reviewed provider identifier."""
     if type(value) is not str:
         return "<invalid>"
-    candidate = value.strip().casefold()
+    candidate = value.strip().lower()
     if not candidate:
         return "(not set)"
     return candidate if candidate in _SAFE_PROVIDER_IDS else "<custom/unknown>"
@@ -383,7 +390,7 @@ def _safe_model_status(value: Any) -> str:
 def _safe_enum(value: Any, *, allowed: frozenset[str]) -> str:
     """Render a documented routing enum and suppress unexpected scalar data."""
     if type(value) is str:
-        candidate = value.strip().casefold()
+        candidate = value.strip().lower()
         if candidate in allowed:
             return candidate
     return "<invalid>"
@@ -396,9 +403,9 @@ def _safe_env_reference(value: Any) -> str:
         return "not set"
     if value_type is str and not value.strip():
         return "not set"
-    if value_type in (bool, float, int) and not value:
+    if (value_type is bool or value_type is float or value_type is int) and not value:
         return "not set"
-    if value_type in (bytes, bytearray) and not value:
+    if (value_type is bytes or value_type is bytearray) and not value:
         return "not set"
     if _is_known_empty_container(value):
         return "not set"
@@ -418,7 +425,7 @@ def _safe_base_url(value: Any) -> str:
         parsed = urlsplit(candidate)
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
             return "<invalid>"
-        hostname = parsed.hostname.casefold()
+        hostname = parsed.hostname.lower()
         displayed_host = (
             hostname
             if hostname in _SAFE_PUBLIC_ENDPOINT_HOSTS
@@ -427,7 +434,7 @@ def _safe_base_url(value: Any) -> str:
 
         path = parsed.path
         if path and path != "/":
-            segments = [segment.casefold() for segment in path.split("/") if segment]
+            segments = [segment.lower() for segment in path.split("/") if segment]
             if all(
                 segment.lower() in _SAFE_BASE_PATH_SEGMENTS
                 or segment in _SAFE_BASE_VERSION_SEGMENTS
@@ -542,9 +549,11 @@ def _config_overrides(config: dict, *, show_keys: bool = False) -> dict[str, str
     # Fallback providers
     try:
         fallbacks = config.get("fallback_providers", [])
+        fallback_type = type(fallbacks)
+        fallback_is_plain_container = fallback_type is dict or fallback_type is list
         has_fallbacks = (
-            (type(fallbacks) in {dict, list} and len(fallbacks) > 0)
-            or (type(fallbacks) not in {dict, list} and fallbacks is not None)
+            (fallback_is_plain_container and len(fallbacks) > 0)
+            or (not fallback_is_plain_container and fallbacks is not None)
         )
         if has_fallbacks:
             sanitized_fallbacks = _sanitize_fallback_providers(

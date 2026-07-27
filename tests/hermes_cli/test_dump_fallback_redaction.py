@@ -55,6 +55,18 @@ class _ExplodingString(str):
         return "_ExplodingString(<sensitive>)"
 
 
+class _ExplodingMetaclass(type):
+    def __eq__(cls, other: object) -> bool:
+        raise RuntimeError("metaclass equality must not run")
+
+    def __hash__(cls) -> int:
+        raise RuntimeError("metaclass hashing must not run")
+
+
+class _MetaclassCredential(metaclass=_ExplodingMetaclass):
+    pass
+
+
 def _fallback_payload(config: dict, *, show_keys: bool = False):
     from hermes_cli import dump
 
@@ -159,6 +171,42 @@ def test_routing_modes_match_runtime_string_normalization():
 
     assert payload[0]["api_mode"] == "chat_completions"
     assert payload[0]["transport"] == "openai_chat"
+
+
+def test_unicode_casefold_does_not_expand_unknown_runtime_routes():
+    payload, _ = _fallback_payload(
+        {
+            "fallback_providers": [
+                {
+                    "provider": "fireworkſ",
+                    "model": "diagnostic-model",
+                    "api_mode": "chat_completionſ",
+                },
+            ],
+        },
+    )
+
+    assert payload[0]["provider"] == "<custom/unknown>"
+    assert payload[0]["api_mode"] == "<invalid>"
+
+
+@pytest.mark.parametrize("show_keys", [False, True])
+def test_custom_metaclass_code_never_runs_at_redaction_boundary(show_keys):
+    from hermes_cli import dump
+
+    credential = _MetaclassCredential()
+
+    assert dump._secret_display(credential, show_keys=show_keys) == (
+        "set" if not show_keys else "***"
+    )
+    assert dump._safe_env_reference(credential) == "configured"
+
+    payload, rendered = _fallback_payload(
+        {"fallback_providers": credential},
+        show_keys=show_keys,
+    )
+    assert payload == "<invalid fallback_providers>"
+    assert "_MetaclassCredential" not in rendered
 
 
 def test_unknown_nested_fields_are_omitted_without_traversing_or_stringifying():
