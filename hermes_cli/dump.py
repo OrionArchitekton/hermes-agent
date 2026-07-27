@@ -247,6 +247,7 @@ _SAFE_PROVIDER_IDS = frozenset({
     "copilot-acp",
     "custom",
     "deepseek",
+    "fireworks",
     "gemini",
     "gmi",
     "huggingface",
@@ -260,6 +261,7 @@ _SAFE_PROVIDER_IDS = frozenset({
     "moa",
     "nous",
     "nvidia",
+    "novita",
     "ollama",
     "ollama-cloud",
     "openai-api",
@@ -270,6 +272,7 @@ _SAFE_PROVIDER_IDS = frozenset({
     "qwen-oauth",
     "stepfun",
     "tencent-tokenhub",
+    "vertex",
     "xai",
     "xai-oauth",
     "xiaomi",
@@ -324,6 +327,13 @@ _SAFE_BASE_VERSION_SEGMENTS = frozenset({
 })
 
 
+def _is_known_empty_container(value: Any) -> bool:
+    """Match YAML's empty built-in containers without invoking user code."""
+    if type(value) in (dict, list, set, tuple, frozenset):
+        return len(value) == 0
+    return False
+
+
 def _secret_display(value: Any, *, show_keys: bool) -> str:
     """Render a secret with the dump command's existing display semantics."""
     value_type = type(value)
@@ -334,6 +344,8 @@ def _secret_display(value: Any, *, show_keys: bool) -> str:
     if value_type in (bool, float, int) and not value:
         return "not set"
     if value_type in (bytes, bytearray) and not value:
+        return "not set"
+    if _is_known_empty_container(value):
         return "not set"
     if not show_keys:
         return "set"
@@ -370,8 +382,10 @@ def _safe_model_status(value: Any) -> str:
 
 def _safe_enum(value: Any, *, allowed: frozenset[str]) -> str:
     """Render a documented routing enum and suppress unexpected scalar data."""
-    if type(value) is str and value in allowed:
-        return value
+    if type(value) is str:
+        candidate = value.strip().casefold()
+        if candidate in allowed:
+            return candidate
     return "<invalid>"
 
 
@@ -385,6 +399,8 @@ def _safe_env_reference(value: Any) -> str:
     if value_type in (bool, float, int) and not value:
         return "not set"
     if value_type in (bytes, bytearray) and not value:
+        return "not set"
+    if _is_known_empty_container(value):
         return "not set"
     # A credential can be deliberately or accidentally shaped exactly like an
     # uppercase environment name. No syntax test can authorize its bytes.

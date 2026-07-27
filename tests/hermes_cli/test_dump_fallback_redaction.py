@@ -1,6 +1,8 @@
 """Fallback-provider diagnostics must never render raw credentials."""
 
+import ast
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -101,6 +103,99 @@ def test_known_fallback_fields_preserve_safe_routing_and_mask_credentials():
     shown, rendered_shown = _fallback_payload(config, show_keys=True)
     assert shown[0]["api_key"] == dump._redact(inline_key)
     assert inline_key not in rendered_shown
+
+
+@pytest.mark.parametrize("provider", ["fireworks", "novita", "vertex"])
+def test_source_defined_provider_identity_is_preserved(provider):
+    payload, _ = _fallback_payload(
+        {
+            "fallback_providers": [
+                {
+                    "provider": provider,
+                    "model": "diagnostic-model",
+                },
+            ],
+        },
+    )
+
+    assert payload[0]["provider"] == provider
+
+
+def test_source_defined_provider_allowlist_covers_static_catalog():
+    """Static built-ins stay useful without admitting dynamic plugin names."""
+    from hermes_cli import dump
+
+    source = (
+        Path(__file__).resolve().parents[2] / "hermes_cli" / "models.py"
+    ).read_text()
+    module = ast.parse(source)
+    catalog = next(
+        node
+        for node in module.body
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "CANONICAL_PROVIDERS"
+        )
+    )
+    assert isinstance(catalog.value, ast.List)
+    static_provider_ids = {
+        entry.args[0].value
+        for entry in catalog.value.elts
+        if (
+            isinstance(entry, ast.Call)
+            and isinstance(entry.func, ast.Name)
+            and entry.func.id == "ProviderEntry"
+            and entry.args
+            and isinstance(entry.args[0], ast.Constant)
+            and isinstance(entry.args[0].value, str)
+        )
+    }
+
+    assert static_provider_ids
+    assert static_provider_ids <= dump._SAFE_PROVIDER_IDS
+
+
+@pytest.mark.parametrize("empty_value", [[], {}])
+@pytest.mark.parametrize("show_keys", [False, True])
+def test_empty_yaml_credential_containers_match_runtime_not_set(
+    empty_value,
+    show_keys,
+):
+    payload, _ = _fallback_payload(
+        {
+            "fallback_providers": [
+                {
+                    "provider": "custom",
+                    "model": "diagnostic-model",
+                    "api_key": empty_value,
+                    "key_env": empty_value,
+                },
+            ],
+        },
+        show_keys=show_keys,
+    )
+
+    assert payload[0]["api_key"] == "not set"
+    assert payload[0]["key_env"] == "not set"
+
+
+def test_routing_modes_match_runtime_string_normalization():
+    payload, _ = _fallback_payload(
+        {
+            "fallback_providers": [
+                {
+                    "provider": "custom",
+                    "model": "diagnostic-model",
+                    "api_mode": " Chat_Completions ",
+                    "transport": " OPENAI_CHAT ",
+                },
+            ],
+        },
+    )
+
+    assert payload[0]["api_mode"] == "chat_completions"
+    assert payload[0]["transport"] == "openai_chat"
 
 
 def test_unknown_nested_fields_are_omitted_without_traversing_or_stringifying():
