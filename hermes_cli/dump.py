@@ -12,6 +12,8 @@ import platform
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
 
 from hermes_cli.config import get_hermes_home, get_env_path, get_project_root, load_config
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -223,7 +225,285 @@ def _get_model_and_provider(config: dict) -> tuple[str, str]:
     return model, provider
 
 
-def _config_overrides(config: dict) -> dict[str, str]:
+_FALLBACK_DIAGNOSTIC_FIELDS = (
+    "provider",
+    "model",
+    "base_url",
+    "api_mode",
+    "transport",
+    "key_env",
+    "api_key_env",
+    "api_key",
+)
+_FALLBACK_DIAGNOSTIC_FIELD_SET = frozenset(_FALLBACK_DIAGNOSTIC_FIELDS)
+_SAFE_PROVIDER_IDS = frozenset({
+    "alibaba",
+    "alibaba-coding-plan",
+    "anthropic",
+    "arcee",
+    "azure-foundry",
+    "bedrock",
+    "copilot",
+    "copilot-acp",
+    "custom",
+    "deepseek",
+    "fireworks",
+    "gemini",
+    "gmi",
+    "huggingface",
+    "kilocode",
+    "kimi-coding",
+    "kimi-coding-cn",
+    "lmstudio",
+    "minimax",
+    "minimax-cn",
+    "minimax-oauth",
+    "moa",
+    "nous",
+    "nvidia",
+    "novita",
+    "ollama",
+    "ollama-cloud",
+    "openai-api",
+    "openai-codex",
+    "opencode-go",
+    "opencode-zen",
+    "openrouter",
+    "qwen-oauth",
+    "stepfun",
+    "tencent-tokenhub",
+    "vertex",
+    "xai",
+    "xai-oauth",
+    "xiaomi",
+    "zai",
+})
+_SAFE_PUBLIC_ENDPOINT_HOSTS = frozenset({
+    "api.anthropic.com",
+    "api.arcee.ai",
+    "api.deepseek.com",
+    "api.gmi-serving.com",
+    "api.githubcopilot.com",
+    "api.kimi.com",
+    "api.minimax.io",
+    "api.minimaxi.com",
+    "api.moonshot.ai",
+    "api.moonshot.cn",
+    "api.openai.com",
+    "api.stepfun.ai",
+    "api.stepfun.com",
+    "api.x.ai",
+    "api.xiaomimimo.com",
+    "api.z.ai",
+    "generativelanguage.googleapis.com",
+    "ollama.com",
+    "openrouter.ai",
+    "portal.qwen.ai",
+})
+_SAFE_API_MODES = frozenset({
+    "anthropic_messages",
+    "bedrock_converse",
+    "chat_completions",
+    "codex_app_server",
+    "codex_responses",
+})
+_SAFE_TRANSPORTS = _SAFE_API_MODES | {"auto", "openai_chat"}
+_SAFE_BASE_PATH_SEGMENTS = frozenset({
+    "anthropic",
+    "api",
+    "chat",
+    "completions",
+    "models",
+    "openai",
+    "responses",
+})
+_SAFE_BASE_VERSION_SEGMENTS = frozenset({
+    "v1",
+    "v1alpha",
+    "v1beta",
+    "v2",
+    "v3",
+    "v4",
+})
+
+
+def _is_known_empty_container(value: Any) -> bool:
+    """Match YAML's empty built-in containers without invoking user code."""
+    value_type = type(value)
+    if (
+        value_type is dict
+        or value_type is list
+        or value_type is set
+        or value_type is tuple
+        or value_type is frozenset
+    ):
+        return len(value) == 0
+    return False
+
+
+def _secret_display(value: Any, *, show_keys: bool) -> str:
+    """Render a secret with the dump command's existing display semantics."""
+    value_type = type(value)
+    if value is None:
+        return "not set"
+    if value_type is str and not value.strip():
+        return "not set"
+    if (value_type is bool or value_type is float or value_type is int) and not value:
+        return "not set"
+    if (value_type is bytes or value_type is bytearray) and not value:
+        return "not set"
+    if _is_known_empty_container(value):
+        return "not set"
+    if not show_keys:
+        return "set"
+    try:
+        if value_type is str:
+            return _redact(value)
+        if value_type is bytes or value_type is bytearray:
+            return _redact(bytes(value).decode("utf-8", errors="replace"))
+        if value_type is bool or value_type is float or value_type is int:
+            return _redact(str(value))
+    except Exception:
+        pass
+    # Do not call repr()/str() on arbitrary credential objects. Their custom
+    # representation can itself expose the material this boundary protects.
+    return "***"
+
+
+def _safe_provider(value: Any) -> str:
+    """Render only a source-reviewed provider identifier."""
+    if type(value) is not str:
+        return "<invalid>"
+    candidate = value.strip().lower()
+    if not candidate:
+        return "(not set)"
+    return candidate if candidate in _SAFE_PROVIDER_IDS else "<custom/unknown>"
+
+
+def _safe_model_status(value: Any) -> str:
+    """Report model presence without disclosing environment-expanded bytes."""
+    if type(value) is not str:
+        return "<invalid>"
+    return "configured" if value.strip() else "(not set)"
+
+
+def _safe_enum(value: Any, *, allowed: frozenset[str]) -> str:
+    """Render a documented routing enum and suppress unexpected scalar data."""
+    if type(value) is str:
+        candidate = value.strip().lower()
+        if candidate in allowed:
+            return candidate
+    return "<invalid>"
+
+
+def _safe_env_reference(value: Any) -> str:
+    """Report reference presence without trying to distinguish names from keys."""
+    value_type = type(value)
+    if value is None:
+        return "not set"
+    if value_type is str and not value.strip():
+        return "not set"
+    if (value_type is bool or value_type is float or value_type is int) and not value:
+        return "not set"
+    if (value_type is bytes or value_type is bytearray) and not value:
+        return "not set"
+    if _is_known_empty_container(value):
+        return "not set"
+    # A credential can be deliberately or accidentally shaped exactly like an
+    # uppercase environment name. No syntax test can authorize its bytes.
+    return "configured"
+
+
+def _safe_base_url(value: Any) -> str:
+    """Retain endpoint routing without URL-carried credentials or private data."""
+    if type(value) is not str:
+        return "<invalid>"
+    candidate = value.strip()
+    if not candidate:
+        return "(not set)"
+    try:
+        parsed = urlsplit(candidate)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return "<invalid>"
+        hostname = parsed.hostname.lower()
+        displayed_host = (
+            hostname
+            if hostname in _SAFE_PUBLIC_ENDPOINT_HOSTS
+            else "<custom-endpoint>"
+        )
+
+        path = parsed.path
+        if path and path != "/":
+            segments = [segment.lower() for segment in path.split("/") if segment]
+            if all(
+                segment.lower() in _SAFE_BASE_PATH_SEGMENTS
+                or segment in _SAFE_BASE_VERSION_SEGMENTS
+                for segment in segments
+            ):
+                path = "/" + "/".join(segments)
+            else:
+                path = "/<path-omitted>"
+
+        # Userinfo is removed while rebuilding netloc. Query strings and
+        # fragments are omitted wholesale because custom gateways commonly
+        # carry opaque credentials in names that no denylist can enumerate.
+        return f"{parsed.scheme.lower()}://{displayed_host}{path}"
+    except Exception:
+        return "<invalid>"
+
+
+def _sanitize_fallback_entry(
+    entry: Any,
+    *,
+    show_keys: bool,
+) -> dict[str, Any] | str:
+    """Return only runtime-relevant fallback fields from a plain YAML mapping."""
+    if type(entry) is not dict:
+        return "<invalid fallback entry>"
+
+    sanitized: dict[str, Any] = {}
+    for field in _FALLBACK_DIAGNOSTIC_FIELDS:
+        if field not in entry:
+            continue
+        value = entry[field]
+        if field == "provider":
+            sanitized[field] = _safe_provider(value)
+        elif field == "model":
+            sanitized[field] = _safe_model_status(value)
+        elif field == "base_url":
+            sanitized[field] = _safe_base_url(value)
+        elif field == "api_mode":
+            sanitized[field] = _safe_enum(value, allowed=_SAFE_API_MODES)
+        elif field == "transport":
+            sanitized[field] = _safe_enum(value, allowed=_SAFE_TRANSPORTS)
+        elif field in {"key_env", "api_key_env"}:
+            sanitized[field] = _safe_env_reference(value)
+        else:
+            sanitized[field] = _secret_display(value, show_keys=show_keys)
+
+    omitted_fields = sum(
+        1
+        for key in entry
+        if not isinstance(key, str) or key not in _FALLBACK_DIAGNOSTIC_FIELD_SET
+    )
+    if omitted_fields:
+        sanitized["omitted_fields"] = omitted_fields
+    return sanitized
+
+
+def _sanitize_fallback_providers(value: Any, *, show_keys: bool) -> Any:
+    """Sanitize the accepted dict/list shapes without traversing unknown data."""
+    if type(value) is dict:
+        return _sanitize_fallback_entry(value, show_keys=show_keys)
+    if type(value) is list:
+        return [
+            _sanitize_fallback_entry(entry, show_keys=show_keys)
+            for entry in value
+        ]
+    return "<invalid fallback_providers>"
+
+
+def _config_overrides(config: dict, *, show_keys: bool = False) -> dict[str, str]:
     """Find non-default config values worth reporting.
     
     Returns a flat dict of dotpath -> value for interesting overrides.
@@ -267,9 +547,28 @@ def _config_overrides(config: dict) -> dict[str, str]:
         overrides["toolsets"] = str(user_toolsets)
 
     # Fallback providers
-    fallbacks = config.get("fallback_providers", [])
-    if fallbacks:
-        overrides["fallback_providers"] = str(fallbacks)
+    try:
+        fallbacks = config.get("fallback_providers", [])
+        fallback_type = type(fallbacks)
+        fallback_is_plain_container = fallback_type is dict or fallback_type is list
+        has_fallbacks = (
+            (fallback_is_plain_container and len(fallbacks) > 0)
+            or (not fallback_is_plain_container and fallbacks is not None)
+        )
+        if has_fallbacks:
+            sanitized_fallbacks = _sanitize_fallback_providers(
+                fallbacks,
+                show_keys=show_keys,
+            )
+            overrides["fallback_providers"] = json.dumps(
+                sanitized_fallbacks,
+                ensure_ascii=False,
+            )
+    except Exception:
+        # Diagnostic output is a security boundary. A malformed custom
+        # container must not turn its exception text into a second
+        # stringification path for credential material.
+        overrides["fallback_providers"] = '"<redaction failed>"'
 
     return overrides
 
@@ -433,7 +732,7 @@ def run_dump(args):
     lines.append(f"  skills:             {_count_skills(hermes_home)}")
 
     # Config overrides (non-default values)
-    overrides = _config_overrides(config)
+    overrides = _config_overrides(config, show_keys=show_keys)
     if overrides:
         lines.append("")
         lines.append("config_overrides:")
