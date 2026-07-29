@@ -19,9 +19,10 @@ their current behavior.
 - The launcher is POSIX-only and requires `/bin/bash`, `O_NOFOLLOW`,
   `O_DIRECTORY`, `F_DUPFD_CLOEXEC`, and `/dev/fd`.
 - This feature does not create, rename, pause, resume, or run any cron job.
-- Merging or deploying the source does not activate isolation for an existing
-  job. Activation requires an operator to select a script whose name ends in
-  `.hermes-isolated.sh`.
+- Merging the source does not activate isolation. Deploying it activates
+  isolation for every existing job that already selects a script whose name
+  ends in `.hermes-isolated.sh`; all other existing jobs require an operator to
+  select the reserved suffix.
 - Existing `.sh`, `.bash`, and Python-selected scripts keep their current
   interpreter and environment behavior.
 
@@ -110,8 +111,10 @@ Acceptance:
 - Runtime activation requires a reviewed artifact that the Hermes runtime
   identity cannot modify; retaining an inode descriptor prevents pathname
   replacement but does not make a writable inode immutable.
-- Renaming an existing script or changing a live job to select the reserved
-  suffix is an activation action, not part of source rollout.
+- Deploying while an existing job already selects the reserved suffix,
+  renaming an existing script to that suffix, or changing a live job to select
+  it is an activation action. Each requires the runtime authority and validation
+  evidence described by the operator runbook.
 
 ## Test Seam
 

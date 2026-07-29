@@ -35,12 +35,21 @@ launcher behavior.
 1. Review the source diff and the feature spec.
 2. Run the focused source validation below.
 3. Merge through the normal repository review path.
-4. Deploy the merged Hermes source through the existing controlled deployment
+4. Before deployment, enumerate all jobs through the supported cron list
+   interface with disabled jobs included. Record every job whose selected
+   `script` has an exact, case-sensitive basename ending in
+   `.hermes-isolated.sh`.
+5. If the inventory is non-empty, treat deployment as activation for every
+   recorded job. Do not deploy until each runnable job has separate runtime
+   authority and the artifact, job snapshot, and validation evidence required
+   by **Activation Validation**. Preserve the complete inventory as rollout and
+   rollback evidence.
+6. Deploy the merged Hermes source through the existing controlled deployment
    path for the target runtime.
 
-A merge is not an activation. A deployment is also not an activation for any
-existing job: no job gains the isolated launcher until its selected script name
-ends in `.hermes-isolated.sh`.
+A merge is not an activation. Deployment is an activation for any existing job
+that already selects the reserved suffix. Other jobs do not gain the isolated
+launcher until their selected script name ends in `.hermes-isolated.sh`.
 
 Live bind-mount changes, script creation or renaming, and cron job mutation on
 `hermes-01` remain separate operator-gated actions. Do not perform them as part
@@ -128,24 +137,30 @@ legacy job as a regression rather than expected isolation behavior.
 
 Source rollback and live-job rollback are separate operations.
 
-1. Retrieve the activation receipt and verify the live job ID and current
-   definition before mutation.
-2. Pause that exact job before deploying source that lacks this contract. Older
-   source may interpret the reserved name as an ordinary `.sh` script and
-   restore inherited environment behavior.
-3. Restore the pre-change job snapshot fields from the receipt with
-   `enabled` forced to `false`. Do not restore a recorded `enabled: true`
-   value yet; keep the job paused throughout source and artifact rollback.
-4. Revert the isolated-launcher source change and deploy the previous reviewed
+1. Enumerate all jobs through the supported cron list interface with disabled
+   jobs included. Record every job whose selected `script` has an exact,
+   case-sensitive basename ending in `.hermes-isolated.sh`.
+2. Retrieve the rollout inventory and activation receipt for every matching job.
+   Reconcile that receipt set with the live inventory; do not continue while a
+   matching job lacks a pre-change snapshot or while a receipt names a job that
+   cannot be accounted for.
+3. Pause every runnable matching job before deploying source that lacks this
+   contract. Older source may interpret each reserved name as an ordinary
+   `.sh` script and restore inherited environment behavior. Re-enumerate the
+   jobs and do not continue while any matching job remains runnable.
+4. Restore every matching job's pre-change snapshot fields with `enabled`
+   forced to `false`. Do not restore a recorded `enabled: true` value yet; keep
+   all affected jobs paused throughout source and artifact rollback.
+5. Revert the isolated-launcher source change and deploy the previous reviewed
    Hermes version through the normal controlled path.
-5. Restore the pre-change artifact or bind-mount state recorded in the receipt
+6. Restore each pre-change artifact or bind-mount state recorded in the receipts
    only when separately authorized.
-6. Validate the restored job definition, source revision, artifact digest, and
-   expected behavior while the job remains paused.
-7. Only after every validation succeeds, restore the receipt's recorded
-   `enabled` state as the final operation for that exact job ID. A job that was
+7. Validate every restored job definition, the source revision, artifact
+   digests, and expected behavior while all affected jobs remain paused.
+8. Only after every validation succeeds, restore each receipt's recorded
+   `enabled` state as the final operation for that job ID. A job that was
    previously disabled remains disabled; any rollback or validation failure
-   leaves the job paused.
+   leaves every affected job paused.
 
 Do not rename scripts, change bind mounts, edit jobs, or restart live services
 as an implicit part of rollback. Those remain separately gated runtime
