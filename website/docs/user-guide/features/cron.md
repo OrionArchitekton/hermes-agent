@@ -447,7 +447,19 @@ Semantics:
 - `{"wakeAgent": false}` on the last line → silent tick (same gate LLM jobs use).
 - No tokens, no model, no provider fallback — the job never touches the inference layer.
 
-`.sh` / `.bash` files run under `/bin/bash`; anything else under the current Python interpreter (`sys.executable`). Scripts must live in `~/.hermes/scripts/` (same sandboxing rule as the pre-run script gate).
+Ordinary `.sh` / `.bash` files retain the legacy Bash launcher; anything else
+uses the current Python interpreter (`sys.executable`). On POSIX, the reserved
+`.hermes-isolated.sh` suffix instead matches the exact case-sensitive lexical
+basename, rejects every symlink component, and runs fixed
+`/bin/bash --noprofile --norc` over held `/dev/fd` references for the verified
+regular file and its parent directory. The scheduler-supplied exec environment
+is exactly `PATH=/usr/bin:/bin`; Bash may synthesize internal variables after
+exec. Ambient `BASH_ENV`, `PYTHONPATH`, `LD_PRELOAD`, `HOME`, locale, proxy,
+credential, and application variables are unavailable. Existing or legacy
+lexical script names do not opt in based on a resolved target. The isolated
+artifact must be unwritable by the Hermes runtime identity. Scripts must remain
+within `~/.hermes/scripts/`; normalized internal paths are accepted, while
+escapes are rejected (same sandboxing rule as the pre-run script gate).
 
 ### The agent sets these up for you
 
