@@ -530,7 +530,10 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
 
     Scripts must be relative paths that resolve within HERMES_HOME/scripts/.
     Absolute paths and ~ expansion are rejected to prevent arbitrary script
-    execution via prompt injection.
+    execution via prompt injection. Internal normalization such as
+    ``nested/../script`` is accepted when the result remains contained; only an
+    escape is rejected. The reserved ``*.hermes-isolated.sh`` suffix changes
+    only runtime launch isolation and does not relax this path validation.
 
     Returns an error string if blocked, else None (valid).
     """
@@ -1039,7 +1042,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "script": {
                 "type": "string",
-                "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). Relative paths resolve under {display_hermes_home()}/scripts/. ``.sh``/``.bash`` extensions run via bash, everything else via Python. On update, pass empty string to clear."
+                "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). Relative paths resolve under {display_hermes_home()}/scripts/. On POSIX, an exact case-sensitive lexical basename ending in ``.hermes-isolated.sh`` uses fixed ``/bin/bash --noprofile --norc``, held script/parent descriptors, and a scheduler-supplied exec environment of exactly ``PATH=/usr/bin:/bin``; symlink components are blocked. Ordinary ``.sh``/``.bash`` selections retain the legacy bash launcher, and everything else uses Python. On update, pass empty string to clear."
             },
             "no_agent": {
                 "type": "boolean",

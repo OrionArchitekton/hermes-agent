@@ -28,7 +28,7 @@ Hermes calls this **no-agent mode**. It's the cron system minus the LLM.
 
 - **No LLM call.** Zero tokens, zero agent loop, zero model spend.
 - **Script is the job.** The script decides whether to alert. Emit output → message gets sent. Emit nothing → silent tick.
-- **Bash or Python.** `.sh` / `.bash` files run under `/bin/bash`; any other extension runs under the current Python interpreter. Anything in `~/.hermes/scripts/` is accepted.
+- **Bash or Python.** Ordinary `.sh` / `.bash` files use the legacy Bash launcher; any other extension uses the current Python interpreter. On POSIX, an exact case-sensitive basename ending in `.hermes-isolated.sh` opts into fixed Bash, held file descriptors, and a minimal exec environment. Scripts remain confined to `~/.hermes/scripts/`.
 - **Same scheduler.** Lives in `cronjob` alongside LLM jobs — pausing, resuming, listing, logs, and delivery targeting all work the same way.
 
 ## When to Use It
@@ -151,16 +151,35 @@ The "silent when empty" behavior is the key to the classic watchdog pattern: the
 
 ## Script Rules
 
-Scripts must live in `~/.hermes/scripts/`. This is enforced at both job-creation time and run time — absolute paths, `~/` expansion, and path-traversal patterns (`../`) are rejected. The same directory is shared with the pre-check script gate used by LLM jobs.
+Scripts must live in `~/.hermes/scripts/`. The cron tool rejects absolute and
+`~/` paths plus any relative path that escapes after normalization. An internal
+form such as `checks/../memory-watchdog.sh` is accepted because it remains
+contained. Runtime containment is also enforced. The same directory is shared
+with the pre-check script gate used by LLM jobs.
 
 Interpreter choice is by file extension:
 
 | Extension | Interpreter |
 |-----------|-------------|
-| `.sh`, `.bash` | `/bin/bash` |
+| Exact `*.hermes-isolated.sh` basename (POSIX only) | `/bin/bash --noprofile --norc` over held script/parent descriptors |
+| `.sh`, `.bash` | Legacy PATH-resolved Bash launcher |
 | anything else | `sys.executable` (current Python) |
 
 We intentionally do NOT honour `#!/...` shebangs — keeping the interpreter set explicit and small reduces the surface the scheduler trusts.
+
+Use the isolated suffix when a reviewed script must not trust scheduler
+variables such as ambient `PATH`, `BASH_ENV`, `PYTHONPATH`, or `LD_PRELOAD`.
+The scheduler-supplied exec environment is exactly `PATH=/usr/bin:/bin`; Bash
+may synthesize internal variables such as `PWD`, `SHLVL`, and `_` after exec.
+No ambient `HOME`, locale, temporary-directory, proxy, virtual-environment,
+credential, or application variable survives. The selected regular file and
+its parent are held through inherited `/dev/fd` descriptors, so pathname swaps
+cannot redirect the current run. Every selected path component must be free of
+symlinks, and the live artifact must be unwritable by the Hermes runtime
+identity because a held descriptor does not freeze writes to the same inode.
+Commands outside `/usr/bin:/bin` are unavailable. Matching is case-sensitive;
+existing or legacy lexical script names do not opt in based on their resolved
+target.
 
 ## Schedule Syntax
 

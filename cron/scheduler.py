@@ -12,11 +12,13 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+import errno
 import json
 import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -2017,6 +2019,10 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
+_IS_POSIX = os.name == "posix"
+_HERMES_ISOLATED_SCRIPT_SUFFIX = ".hermes-isolated.sh"
+_HERMES_ISOLATED_SCRIPT_ENV = {"PATH": "/usr/bin:/bin"}
+_HERMES_ISOLATED_FD_ROOT = "/dev/fd"
 
 
 def _get_script_timeout() -> int:
@@ -2110,6 +2116,110 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+def _normalize_isolated_fd(fd: int) -> int:
+    """Return ``fd`` unchanged when safe, otherwise move it above stdio."""
+    if fd >= 3:
+        return fd
+    duplicate_cloexec = (
+        getattr(fcntl, "F_DUPFD_CLOEXEC", None) if fcntl is not None else None
+    )
+    if duplicate_cloexec is None:
+        os.close(fd)
+        raise OSError(
+            "isolated cron scripts require fcntl.F_DUPFD_CLOEXEC "
+            "when a standard descriptor is closed"
+        )
+    try:
+        normalized_fd = fcntl.fcntl(fd, duplicate_cloexec, 3)
+    except Exception:
+        os.close(fd)
+        raise
+    os.close(fd)
+    return normalized_fd
+
+
+def _open_isolated_cron_script(
+    scripts_dir_anchor: Path, raw: Path
+) -> tuple[int, int, Path]:
+    """Open an isolated script and its parent without following any symlink.
+
+    Each path component is opened relative to a held directory descriptor.
+    The returned descriptors keep both the selected regular-file inode and its
+    parent directory stable until the child process has started.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise OSError(
+            "isolated cron scripts require POSIX O_NOFOLLOW and O_DIRECTORY"
+        )
+    if not os.path.isdir(_HERMES_ISOLATED_FD_ROOT):
+        raise OSError(
+            f"isolated cron scripts require {_HERMES_ISOLATED_FD_ROOT}"
+        )
+
+    if not scripts_dir_anchor.is_absolute():
+        raise OSError("isolated scripts directory anchor must be absolute")
+
+    if raw.is_absolute():
+        lexical_path = Path(os.path.normpath(str(raw)))
+    else:
+        lexical_path = Path(os.path.normpath(str(scripts_dir_anchor / raw)))
+    try:
+        relative = lexical_path.relative_to(scripts_dir_anchor)
+    except ValueError as exc:
+        raise OSError(
+            "isolated script selection escapes the scripts directory"
+        ) from exc
+    if not relative.parts:
+        raise OSError("isolated script selection does not name a file")
+
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    dir_flags = os.O_RDONLY | directory | nofollow | close_on_exec
+    file_flags = (
+        os.O_RDONLY | nofollow | close_on_exec | getattr(os, "O_NONBLOCK", 0)
+    )
+    parent_fd = -1
+    script_fd = -1
+    try:
+        # Open the canonical scripts-directory anchor from a held root
+        # descriptor. O_NOFOLLOW is therefore enforced for every absolute
+        # component, not only the final "scripts" component.
+        parent_fd = _normalize_isolated_fd(os.open("/", dir_flags))
+        for component in scripts_dir_anchor.parts[1:]:
+            next_fd = _normalize_isolated_fd(
+                os.open(component, dir_flags, dir_fd=parent_fd)
+            )
+            os.close(parent_fd)
+            parent_fd = next_fd
+
+        for component in relative.parts[:-1]:
+            next_fd = _normalize_isolated_fd(
+                os.open(component, dir_flags, dir_fd=parent_fd)
+            )
+            os.close(parent_fd)
+            parent_fd = next_fd
+
+        script_fd = _normalize_isolated_fd(
+            os.open(relative.name, file_flags, dir_fd=parent_fd)
+        )
+        if not stat.S_ISREG(os.fstat(script_fd).st_mode):
+            raise OSError("isolated script selection is not a regular file")
+        if not stat.S_ISDIR(os.fstat(parent_fd).st_mode):
+            raise OSError("isolated script parent is not a directory")
+        return parent_fd, script_fd, lexical_path
+    except OSError as exc:
+        if script_fd >= 0:
+            os.close(script_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise OSError(
+                "isolated script selection contains a symlink or indirection"
+            ) from exc
+        raise
+
+
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2120,6 +2230,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     Supported interpreters (chosen by file extension):
 
+    * exact lexical ``*.hermes-isolated.sh`` — on POSIX, open without
+      symlinks and run the held file/parent descriptors with fixed
+      ``/bin/bash --noprofile --norc`` and scheduler-supplied
+      ``PATH=/usr/bin:/bin``
     * ``.sh`` / ``.bash`` — run with ``/bin/bash``
     * anything else — run with the current Python interpreter
       (``sys.executable``), preserving the original behaviour for
@@ -2128,9 +2242,11 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     Shell support lets ``no_agent=True`` jobs ship classic bash watchdogs
     (the `memory-watchdog.sh` pattern) without wrapping them in Python.
 
-    Subprocess environment is passed through ``_sanitize_subprocess_env`` so
+    Legacy script environments pass through ``_sanitize_subprocess_env`` so
     provider credentials and other Hermes-managed secrets are not inherited
-    (SECURITY.md §2.3), matching terminal and MCP child processes.
+    (SECURITY.md §2.3), matching terminal and MCP child processes. Isolated
+    shell scripts instead receive only the fixed scheduler-supplied exec
+    environment. Bash may synthesize its own internal variables after exec.
 
     Args:
         script_path: Path to the script.  Relative paths are resolved
@@ -2141,39 +2257,65 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
     """
-    scripts_dir = _get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    scripts_dir_resolved = scripts_dir.resolve()
-
+    # Classify from the selected lexical basename before resolving any path.
+    # This prevents a selected isolated symlink from downgrading through a
+    # legacy target, and prevents a legacy symlink target from opting in.
+    # We deliberately do NOT honour the file's own shebang.
     raw = Path(script_path).expanduser()
-    if raw.is_absolute():
-        path = raw.resolve()
+    isolated_shell = raw.name.endswith(_HERMES_ISOLATED_SCRIPT_SUFFIX)
+    scripts_dir = _get_hermes_home() / "scripts"
+    if not isolated_shell:
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+    scripts_dir_anchor = Path(os.path.abspath(scripts_dir))
+    held_fds: tuple[int, ...] = ()
+    if isolated_shell:
+        if not _IS_POSIX:
+            return False, (
+                f"Cannot run isolated shell script {raw.name!r}: "
+                "*.hermes-isolated.sh requires a POSIX platform."
+            )
+        if not os.path.isfile("/bin/bash"):
+            return False, (
+                f"Cannot run isolated shell script {raw.name!r}: "
+                "required interpreter /bin/bash was not found."
+            )
+        try:
+            parent_fd, script_fd, path = _open_isolated_cron_script(
+                scripts_dir_anchor, raw
+            )
+        except OSError as exc:
+            return False, f"Blocked isolated script {script_path!r}: {exc}"
+        held_fds = (parent_fd, script_fd)
+        script_fd_path = f"{_HERMES_ISOLATED_FD_ROOT}/{script_fd}"
+        parent_fd_path = f"{_HERMES_ISOLATED_FD_ROOT}/{parent_fd}"
+        argv = ["/bin/bash", "--noprofile", "--norc", script_fd_path]
+        cwd = parent_fd_path
     else:
-        path = (scripts_dir / raw).resolve()
+        scripts_dir_resolved = scripts_dir.resolve()
+        if raw.is_absolute():
+            path = raw.resolve()
+        else:
+            path = (scripts_dir / raw).resolve()
 
-    # Guard against path traversal, absolute path injection, and symlink
-    # escape — scripts MUST reside within HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
-        return False, (
-            f"Blocked: script path resolves outside the scripts directory "
-            f"({scripts_dir_resolved}): {script_path!r}"
-        )
+        # Guard against path traversal, absolute path injection, and symlink
+        # escape — scripts MUST reside within HERMES_HOME/scripts/.
+        try:
+            path.relative_to(scripts_dir_resolved)
+        except ValueError:
+            return False, (
+                f"Blocked: script path resolves outside the scripts directory "
+                f"({scripts_dir_resolved}): {script_path!r}"
+            )
 
-    if not path.exists():
-        return False, f"Script not found: {path}"
-    if not path.is_file():
-        return False, f"Script path is not a file: {path}"
+        if not path.exists():
+            return False, f"Script not found: {path}"
+        if not path.is_file():
+            return False, f"Script path is not a file: {path}"
+        cwd = str(path.parent)
 
     script_timeout = _get_script_timeout()
-
-    # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
-    # everything else.  We deliberately do NOT honour the file's own
-    # shebang: the scripts dir is trusted, but keeping the interpreter
-    # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
-    if suffix in {".sh", ".bash"}:
+    if not isolated_shell and suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
         # shutil.which returns None — fall back to a clear error rather
@@ -2190,13 +2332,11 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         )
         argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
-    else:
+    elif not isolated_shell:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
         argv = [python_exe, str(path)]
 
     try:
-        from tools.environments.local import _sanitize_subprocess_env
-
         popen_kwargs = {}
         if sys.platform == "win32":
             popen_kwargs = {
@@ -2204,15 +2344,21 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 "encoding": "utf-8",
                 "errors": "replace",
             }
-        env = _sanitize_subprocess_env(os.environ.copy())
-        env.update(env_overlay)
+        if isolated_shell:
+            env = dict(_HERMES_ISOLATED_SCRIPT_ENV)
+        else:
+            from tools.environments.local import _sanitize_subprocess_env
+
+            env = _sanitize_subprocess_env(os.environ.copy())
+            env.update(env_overlay)
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=script_timeout,
-            cwd=str(path.parent),
+            cwd=cwd,
             env=env,
+            **({"pass_fds": held_fds} if held_fds else {}),
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
@@ -2242,6 +2388,12 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+    finally:
+        for fd in held_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _run_job_script_with_claim_heartbeat(
@@ -2759,26 +2911,7 @@ def run_job(
             logger.error("Job '%s': %s", job_id, err)
             return False, "", "", err
 
-        # Apply workdir if configured — lets scripts use predictable relative
-        # paths. For no_agent jobs this is just the subprocess cwd (not an
-        # agent TERMINAL_CWD bridge).
-        _job_workdir = (job.get("workdir") or "").strip() or None
-        _prior_cwd = None
-        if _job_workdir and Path(_job_workdir).is_dir():
-            _prior_cwd = os.getcwd()
-            try:
-                os.chdir(_job_workdir)
-            except OSError:
-                _prior_cwd = None
-
-        try:
-            ok, output = _run_job_script_with_claim_heartbeat(job, script_path)
-        finally:
-            if _prior_cwd is not None:
-                try:
-                    os.chdir(_prior_cwd)
-                except OSError:
-                    pass
+        ok, output = _run_job_script_with_claim_heartbeat(job, script_path)
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
